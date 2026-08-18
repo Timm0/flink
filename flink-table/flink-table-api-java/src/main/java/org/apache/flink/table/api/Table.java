@@ -33,6 +33,8 @@ import org.apache.flink.table.legacy.api.TableSchema;
 import org.apache.flink.table.operations.QueryOperation;
 import org.apache.flink.table.types.DataType;
 
+import java.time.Duration;
+
 /**
  * The {@link Table} object is the core abstraction of the Table API. Similar to how the DataStream
  * API has {@code DataStream}s, the Table API is built around {@link Table}s.
@@ -933,6 +935,41 @@ public interface Table extends Explainable<Table>, Executable {
      * @return The complete pipeline from one or more source tables to a sink table.
      */
     TablePipeline insertInto(String tablePath);
+
+    /**
+     * Declares this query as the definition of a materialized table at the given path, refreshed to
+     * stay within the given freshness.
+     *
+     * <p>Nothing happens until {@link Materialization#execute()} is called. Path resolution follows
+     * the same rules as {@link #insertInto(String)}.
+     *
+     * <p>Example:
+     *
+     * <pre>{@code
+     * MaterializedTable silver = tableEnv.from("events")
+     *         .groupBy($("ds"))
+     *         .select($("ds"), $("amount").sum().as("revenue"))
+     *         .materializeAs("silver", Duration.ofMinutes(1))
+     *         .execute();
+     * }</pre>
+     *
+     * @param path The path at which to declare the materialized table.
+     * @param freshness How far behind the source the materialized table may fall.
+     * @return An unsubmitted declaration.
+     */
+    Materialization materializeAs(String path, Duration freshness);
+
+    /**
+     * Declares this query as the definition of a materialized table at the given path, described by
+     * the given descriptor.
+     *
+     * <p>Nothing happens until {@link Materialization#execute()} is called.
+     *
+     * @param path The path at which to declare the materialized table.
+     * @param descriptor Freshness, refresh mode, partitioning, options and any extra schema.
+     * @return An unsubmitted declaration.
+     */
+    Materialization materializeAs(String path, MaterializedTableDescriptor descriptor);
 
     /**
      * Declares that the pipeline defined by the given {@link Table} object should be written to a

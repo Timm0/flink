@@ -37,14 +37,15 @@ import org.apache.flink.table.catalog.Column.MetadataColumn;
 import org.apache.flink.table.catalog.Interval;
 import org.apache.flink.table.catalog.Interval.TimeUnit;
 import org.apache.flink.table.catalog.IntervalFreshness;
+import org.apache.flink.table.catalog.MaterializedTableSchemaChanges;
 import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.catalog.StartMode;
 import org.apache.flink.table.catalog.StartMode.StartModeKind;
 import org.apache.flink.table.catalog.TableChange;
 import org.apache.flink.table.catalog.TableChange.ColumnPosition;
+import org.apache.flink.table.materializedtable.MaterializedTableDefinition;
 import org.apache.flink.table.planner.operations.PlannerQueryOperation;
 import org.apache.flink.table.planner.operations.converters.SqlNodeConverter.ConvertContext;
-import org.apache.flink.table.types.DataType;
 import org.apache.flink.table.utils.DateTimeUtils;
 
 import org.apache.calcite.sql.SqlIntervalLiteral;
@@ -249,17 +250,7 @@ public class MaterializedTableUtils {
 
     public static RefreshMode fromLogicalRefreshModeToRefreshMode(
             LogicalRefreshMode logicalRefreshMode) {
-        switch (logicalRefreshMode) {
-            case AUTOMATIC:
-                return null;
-            case FULL:
-                return RefreshMode.FULL;
-            case CONTINUOUS:
-                return RefreshMode.CONTINUOUS;
-            default:
-                throw new IllegalArgumentException(
-                        "Unknown logical refresh mode: " + logicalRefreshMode);
-        }
+        return MaterializedTableDefinition.toRefreshMode(logicalRefreshMode);
     }
 
     // Used to build changes introduced by changed query like
@@ -444,108 +435,14 @@ public class MaterializedTableUtils {
         }
     }
 
+    /**
+     * Delegates to {@link MaterializedTableSchemaChanges}, where the logic now lives so the Table
+     * API can reach it as well. Kept as the SQL-side entry point.
+     */
     public static List<TableChange> validateAndExtractColumnChanges(
             ResolvedSchema oldSchema, ResolvedSchema newSchema, boolean schemaDefinedInQuery) {
-        final List<Column> oldColumns = oldSchema.getColumns();
-        final Map<String, Tuple2<Column, Integer>> oldByName = new HashMap<>();
-        for (int i = 0; i < oldColumns.size(); i++) {
-            oldByName.put(oldColumns.get(i).getName(), Tuple2.of(oldColumns.get(i), i));
-        }
-        final Set<String> seen = new HashSet<>();
-        final List<Column> newColumns = newSchema.getColumns();
-        final List<TableChange> changes = new ArrayList<>();
-        for (int newIndex = 0; newIndex < newColumns.size(); newIndex++) {
-            final Column newColumn = newColumns.get(newIndex);
-            seen.add(newColumn.getName());
-            final Tuple2<Column, Integer> oldEntry = oldByName.get(newColumn.getName());
-            if (oldEntry == null) {
-                changes.add(addChange(newColumn, schemaDefinedInQuery));
-                continue;
-            }
-            final Column oldColumn = oldEntry.f0;
-            // No position diff: DDL order is arbitrary; query-driven reorders are caught by
-            // buildSchemaTableChanges on the ALTER MT AS path.
-            if (oldColumn.isPhysical()
-                    && newColumn.isPhysical()
-                    && typeChanged(oldColumn, newColumn, schemaDefinedInQuery)) {
-                final DataType newType =
-                        schemaDefinedInQuery
-                                ? newColumn.getDataType()
-                                : newColumn.getDataType().nullable();
-                changes.add(TableChange.modifyPhysicalColumnType(oldColumn, newType));
-                // Type changed; still check whether the comment also changed.
-                final String oldComment = oldColumn.getComment().orElse(null);
-                final String newComment = newColumn.getComment().orElse(null);
-                if (!Objects.equals(oldComment, newComment)) {
-                    changes.add(TableChange.modifyColumnComment(oldColumn, newComment));
-                }
-                continue;
-            }
-            if (oldColumn.getClass() != newColumn.getClass()
-                    || !definitionEquals(oldColumn, newColumn)) {
-                changes.add(
-                        new TableChange.ModifyColumn(
-                                oldColumn,
-                                normalizedColumn(newColumn, schemaDefinedInQuery),
-                                null));
-                continue;
-            }
-            final String oldComment = oldColumn.getComment().orElse(null);
-            final String newComment = newColumn.getComment().orElse(null);
-            if (!Objects.equals(oldComment, newComment)) {
-                changes.add(TableChange.modifyColumnComment(oldColumn, newComment));
-            }
-        }
-
-        for (Map.Entry<String, Tuple2<Column, Integer>> entry : oldByName.entrySet()) {
-            if (seen.contains(entry.getKey())) {
-                continue;
-            }
-            // Without an explicit DDL column list the new schema only reflects the query
-            // projection, so old non-persisted columns are retained, not dropped.
-            if (!schemaDefinedInQuery && !entry.getValue().f0.isPersisted()) {
-                continue;
-            }
-            changes.add(TableChange.dropColumn(entry.getKey()));
-        }
-        return changes;
-    }
-
-    private static TableChange.AddColumn addChange(Column column, boolean schemaDefinedInQuery) {
-        return TableChange.add(normalizedColumn(column, schemaDefinedInQuery));
-    }
-
-    private static Column normalizedColumn(Column column, boolean schemaDefinedInQuery) {
-        return schemaDefinedInQuery ? column : column.copy(column.getDataType().nullable());
-    }
-
-    private static boolean definitionEquals(Column oldColumn, Column newColumn) {
-        if (oldColumn instanceof MetadataColumn && newColumn instanceof MetadataColumn) {
-            final MetadataColumn oldMeta = (MetadataColumn) oldColumn;
-            final MetadataColumn newMeta = (MetadataColumn) newColumn;
-            return oldMeta.isVirtual() == newMeta.isVirtual()
-                    && Objects.equals(
-                            oldMeta.getMetadataKey().orElse(null),
-                            newMeta.getMetadataKey().orElse(null))
-                    && oldMeta.getDataType().equals(newMeta.getDataType());
-        }
-        if (oldColumn instanceof ComputedColumn && newColumn instanceof ComputedColumn) {
-            return Objects.equals(
-                    ((ComputedColumn) oldColumn).getExpression(),
-                    ((ComputedColumn) newColumn).getExpression());
-        }
-        return true;
-    }
-
-    private static boolean typeChanged(
-            Column oldColumn, Column newColumn, boolean schemaDefinedInQuery) {
-        final DataType oldType = oldColumn.getDataType();
-        final DataType newType = newColumn.getDataType();
-        // schemaDefinedInQuery=false: schema is inferred from the query, which may flip
-        // nullability without intent — only the base type difference is a real change.
-        return schemaDefinedInQuery
-                ? !oldType.equals(newType)
-                : !oldType.nullable().equals(newType.nullable());
+        return MaterializedTableSchemaChanges.validateAndExtractColumnChanges(
+                oldSchema, newSchema, schemaDefinedInQuery);
     }
 
     public static ResolvedSchema getQueryOperationResolvedSchema(

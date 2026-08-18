@@ -29,6 +29,7 @@ import org.apache.flink.table.catalog.CatalogManager;
 import org.apache.flink.table.delegation.InternalPlan;
 import org.apache.flink.table.delegation.Parser;
 import org.apache.flink.table.legacy.sources.TableSource;
+import org.apache.flink.table.materializedtable.MaterializedTableLifecycle;
 import org.apache.flink.table.operations.ModifyOperation;
 import org.apache.flink.table.operations.Operation;
 import org.apache.flink.table.operations.QueryOperation;
@@ -58,6 +59,18 @@ public interface TableEnvironmentInternal extends TableEnvironment {
 
     /** Returns a {@link OperationTreeBuilder} that can create {@link QueryOperation}s. */
     OperationTreeBuilder getOperationTreeBuilder();
+
+    /**
+     * Returns this session's {@link MaterializedTableLifecycle}, discovering it on first use.
+     *
+     * <p>Needed beyond operation execution because a {@link
+     * org.apache.flink.table.api.MaterializedTable} handle asks the lifecycle directly for a client
+     * to a running refresh job, which no operation expresses.
+     */
+    MaterializedTableLifecycle getMaterializedTableLifecycle();
+
+    /** Returns the context this session hands to its {@link MaterializedTableLifecycle}. */
+    MaterializedTableLifecycle.Context getMaterializedTableLifecycleContext();
 
     /**
      * Creates a table from a table source.

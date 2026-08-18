@@ -33,6 +33,7 @@ import org.apache.flink.table.api.ExplainDetail;
 import org.apache.flink.table.api.ExplainFormat;
 import org.apache.flink.table.api.Expressions;
 import org.apache.flink.table.api.FunctionDescriptor;
+import org.apache.flink.table.api.MaterializedTable;
 import org.apache.flink.table.api.Model;
 import org.apache.flink.table.api.ModelDescriptor;
 import org.apache.flink.table.api.PlanReference;
@@ -86,6 +87,7 @@ import org.apache.flink.table.expressions.utils.ApiExpressionDefaultVisitor;
 import org.apache.flink.table.factories.ApiFactoryUtil;
 import org.apache.flink.table.factories.CatalogStoreFactory;
 import org.apache.flink.table.factories.FactoryUtil;
+import org.apache.flink.table.factories.MaterializedTableLifecycleFactoryUtil;
 import org.apache.flink.table.factories.PlannerFactoryUtil;
 import org.apache.flink.table.factories.TableFactoryUtil;
 import org.apache.flink.table.functions.ScalarFunction;
@@ -93,6 +95,7 @@ import org.apache.flink.table.functions.UserDefinedFunction;
 import org.apache.flink.table.functions.UserDefinedFunctionHelper;
 import org.apache.flink.table.legacy.sinks.TableSink;
 import org.apache.flink.table.legacy.sources.TableSource;
+import org.apache.flink.table.materializedtable.MaterializedTableLifecycle;
 import org.apache.flink.table.module.Module;
 import org.apache.flink.table.module.ModuleEntry;
 import org.apache.flink.table.module.ModuleManager;
@@ -115,6 +118,7 @@ import org.apache.flink.table.operations.command.ExecutePlanOperation;
 import org.apache.flink.table.operations.ddl.AnalyzeTableOperation;
 import org.apache.flink.table.operations.ddl.CompilePlanOperation;
 import org.apache.flink.table.operations.ddl.CreateTableOperation;
+import org.apache.flink.table.operations.materializedtable.MaterializedTableOperation;
 import org.apache.flink.table.operations.utils.ExecutableOperationUtils;
 import org.apache.flink.table.operations.utils.OperationTreeBuilder;
 import org.apache.flink.table.resource.ResourceManager;
@@ -172,6 +176,13 @@ public class TableEnvironmentImpl implements TableEnvironmentInternal {
     protected final Planner planner;
     private final boolean isStreamingMode;
     private final ExecutableOperation.Context operationCtx;
+
+    /**
+     * Discovered on first materialized table operation; see {@code getMaterializedTableLifecycle}.
+     */
+    private MaterializedTableLifecycle materializedTableLifecycle;
+
+    private MaterializedTableLifecycle.Context materializedTableLifecycleContext;
 
     private static final String UNSUPPORTED_QUERY_IN_EXECUTE_SQL_MSG =
             "Unsupported SQL query! executeSql() only accepts a single SQL statement of type "
@@ -239,6 +250,86 @@ public class TableEnvironmentImpl implements TableEnvironmentInternal {
                         resourceManager,
                         tableConfig,
                         isStreamingMode);
+    }
+
+    /**
+     * Returns the materialized table lifecycle, discovering it on first use.
+     *
+     * <p>Lazy on purpose: the default implementation ships in the planner, which in a distribution
+     * sits behind the planner loader. Discovering it eagerly would make every {@code
+     * TableEnvironment} pay for a plugin most of them never touch.
+     */
+    @Override
+    public synchronized MaterializedTableLifecycle getMaterializedTableLifecycle() {
+        if (materializedTableLifecycle == null) {
+            final MaterializedTableLifecycle lifecycle =
+                    MaterializedTableLifecycleFactoryUtil.createMaterializedTableLifecycle(
+                            tableConfig.getConfiguration(), resourceManager.getUserClassLoader());
+            try {
+                lifecycle.open();
+            } catch (Exception e) {
+                throw new TableException("Failed to open the materialized table lifecycle.", e);
+            }
+            materializedTableLifecycle = lifecycle;
+        }
+        return materializedTableLifecycle;
+    }
+
+    @Override
+    public synchronized MaterializedTableLifecycle.Context getMaterializedTableLifecycleContext() {
+        if (materializedTableLifecycleContext == null) {
+            materializedTableLifecycleContext =
+                    new TableEnvironmentLifecycleContext(
+                            operationCtx, this::createRefreshJobEnvironment);
+        }
+        return materializedTableLifecycleContext;
+    }
+
+    /**
+     * Builds an environment for running a materialized table refresh job under {@code
+     * executionConfig}.
+     *
+     * <p>Shares the catalog, modules and resources with this environment so the table being
+     * refreshed is visible, but takes its own executor, planner and config — a refresh may run in a
+     * different runtime mode than the session that declared it, which is not something an existing
+     * environment can be talked into.
+     */
+    private TableEnvironmentInternal createRefreshJobEnvironment(Configuration executionConfig) {
+        final Configuration mergedConfig = new Configuration(tableConfig.getConfiguration());
+        mergedConfig.addAll(executionConfig);
+
+        final EnvironmentSettings settings =
+                EnvironmentSettings.newInstance().withConfiguration(mergedConfig).build();
+        final ClassLoader userClassLoader = resourceManager.getUserClassLoader();
+
+        final ExecutorFactory executorFactory =
+                FactoryUtil.discoverFactory(
+                        userClassLoader, ExecutorFactory.class, ExecutorFactory.DEFAULT_IDENTIFIER);
+        final Executor refreshExecutor = executorFactory.create(mergedConfig);
+
+        final TableConfig refreshTableConfig = TableConfig.getDefault();
+        refreshTableConfig.setRootConfiguration(tableConfig.getRootConfiguration());
+        refreshTableConfig.addConfiguration(mergedConfig);
+
+        final FunctionCatalog refreshFunctionCatalog = functionCatalog.copy(resourceManager);
+        final Planner refreshPlanner =
+                PlannerFactoryUtil.createPlanner(
+                        refreshExecutor,
+                        refreshTableConfig,
+                        userClassLoader,
+                        moduleManager,
+                        catalogManager,
+                        refreshFunctionCatalog);
+
+        return new TableEnvironmentImpl(
+                catalogManager,
+                moduleManager,
+                resourceManager,
+                refreshTableConfig,
+                refreshExecutor,
+                refreshFunctionCatalog,
+                refreshPlanner,
+                settings.isStreamingMode());
     }
 
     public static TableEnvironmentImpl create(Configuration configuration) {
@@ -772,6 +863,22 @@ public class TableEnvironmentImpl implements TableEnvironmentInternal {
     @Override
     public String[] listMaterializedTables() {
         return catalogManager.listMaterializedTables().stream().sorted().toArray(String[]::new);
+    }
+
+    @Override
+    public String[] listMaterializedTables(String catalogName, String databaseName) {
+        return catalogManager.listMaterializedTables(catalogName, databaseName).stream()
+                .sorted()
+                .toArray(String[]::new);
+    }
+
+    @Override
+    public MaterializedTable materializedTable(String path) {
+        final MaterializedTable materializedTable =
+                new MaterializedTableImpl(this, getObjectIdentifierFromPath(path));
+        // Resolve eagerly so a wrong path fails here rather than on the first operation.
+        materializedTable.info();
+        return materializedTable;
     }
 
     @Override
@@ -1314,6 +1421,18 @@ public class TableEnvironmentImpl implements TableEnvironmentInternal {
 
     @Override
     public TableResultInternal executeInternal(Operation operation) {
+        // Materialized tables are checked first, and deliberately before ExecutableOperation:
+        // CREATE and DROP are themselves ExecutableOperations whose execute() only writes the
+        // catalog entry. Letting them take that branch reports success while starting no refresh
+        // job — and, on DROP, orphans a running one. The lifecycle performs the same catalog write
+        // internally, surrounded by the job and workflow actions that make it meaningful.
+        if (operation instanceof MaterializedTableOperation) {
+            return getMaterializedTableLifecycle()
+                    .execute(
+                            getMaterializedTableLifecycleContext(),
+                            (MaterializedTableOperation) operation);
+        }
+
         // delegate execution to Operation if it implements ExecutableOperation
         if (operation instanceof ExecutableOperation) {
             return ((ExecutableOperation) operation).execute(operationCtx);

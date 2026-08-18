@@ -28,6 +28,8 @@ import org.apache.flink.table.api.GroupWindow;
 import org.apache.flink.table.api.GroupWindowedTable;
 import org.apache.flink.table.api.GroupedTable;
 import org.apache.flink.table.api.InsertConflictStrategy;
+import org.apache.flink.table.api.Materialization;
+import org.apache.flink.table.api.MaterializedTableDescriptor;
 import org.apache.flink.table.api.OverWindow;
 import org.apache.flink.table.api.OverWindowedTable;
 import org.apache.flink.table.api.PartitionedTable;
@@ -64,6 +66,7 @@ import org.apache.flink.table.operations.utils.OperationTreeBuilder;
 
 import javax.annotation.Nullable;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -487,6 +490,16 @@ public class TableImpl implements Table {
                 ContextResolvedTable.anonymous(resolvedCatalogBaseTable),
                 conflictStrategy,
                 overwrite);
+    }
+
+    @Override
+    public Materialization materializeAs(String path, Duration freshness) {
+        return materializeAs(path, MaterializedTableDescriptor.ofFreshness(freshness).build());
+    }
+
+    @Override
+    public Materialization materializeAs(String path, MaterializedTableDescriptor descriptor) {
+        return MaterializationImpl.of(tableEnvironment, getQueryOperation(), path, descriptor);
     }
 
     @Override

@@ -1290,6 +1290,37 @@ public interface TableEnvironment {
     String[] listMaterializedTables();
 
     /**
+     * Gets the names of all materialized tables in the given catalog and database.
+     *
+     * <p>The namespace-scoped counterpart to {@link #listMaterializedTables()}, which reads the
+     * current namespace.
+     *
+     * @return A list of the names of all registered materialized tables in the given database of
+     *     the given catalog.
+     */
+    String[] listMaterializedTables(String catalogName, String databaseName);
+
+    /**
+     * Returns a handle to an existing materialized table, for inspecting and operating it without
+     * redeclaring it.
+     *
+     * <p>Follows the same path resolution rules as {@link #from(String)}. Reaches materialized
+     * tables declared by earlier sessions, including their running refresh jobs.
+     *
+     * <p>Example:
+     *
+     * <pre>{@code
+     * MaterializedTable silver = tableEnv.materializedTable("silver");
+     * silver.refresh(Map.of("ds", "2026-08-12")).await();
+     * }</pre>
+     *
+     * @param path The path of the materialized table.
+     * @throws ValidationException if nothing exists at the path, or what does is not a materialized
+     *     table.
+     */
+    MaterializedTable materializedTable(String path);
+
+    /**
      * Gets the names of all temporary tables and views available in the current namespace (the
      * current database of the current catalog).
      *

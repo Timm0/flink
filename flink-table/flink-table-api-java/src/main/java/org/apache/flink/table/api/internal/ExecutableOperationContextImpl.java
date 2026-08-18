@@ -53,6 +53,17 @@ public class ExecutableOperationContextImpl implements ExecutableOperation.Conte
         this.isStreamingMode = isStreamingMode;
     }
 
+    /** Copies another context, for subclasses that add capabilities to an existing one. */
+    public ExecutableOperationContextImpl(ExecutableOperation.Context context) {
+        this(
+                context.getCatalogManager(),
+                context.getFunctionCatalog(),
+                context.getModuleManager(),
+                context.getResourceManager(),
+                context.getTableConfig(),
+                context.isStreamingMode());
+    }
+
     @Override
     public CatalogManager getCatalogManager() {
         return catalogManager;

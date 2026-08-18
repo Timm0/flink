@@ -564,16 +564,19 @@ public class OperationExecutor {
     }
 
     public ResultFetcher callExecutableOperation(OperationHandle handle, ExecutableOperation op) {
-        TableResultInternal result =
-                op.execute(
-                        new ExecutableOperationContextImpl(
-                                sessionContext.getSessionState().catalogManager,
-                                sessionContext.getSessionState().functionCatalog,
-                                sessionContext.getSessionState().moduleManager,
-                                sessionContext.getSessionState().resourceManager,
-                                tableConfig(),
-                                sessionContext.getSessionConf().get(RUNTIME_MODE) == STREAMING));
+        TableResultInternal result = op.execute(getExecutableOperationContext());
         return ResultFetcher.fromTableResult(handle, result, false);
+    }
+
+    /** The session state this executor hands to operations that execute themselves. */
+    public ExecutableOperationContextImpl getExecutableOperationContext() {
+        return new ExecutableOperationContextImpl(
+                sessionContext.getSessionState().catalogManager,
+                sessionContext.getSessionState().functionCatalog,
+                sessionContext.getSessionState().moduleManager,
+                sessionContext.getSessionState().resourceManager,
+                tableConfig(),
+                sessionContext.getSessionConf().get(RUNTIME_MODE) == STREAMING);
     }
 
     public ResultFetcher refreshMaterializedTable(
