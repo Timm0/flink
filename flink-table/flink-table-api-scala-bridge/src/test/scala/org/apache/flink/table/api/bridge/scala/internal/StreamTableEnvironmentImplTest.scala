@@ -25,7 +25,7 @@ import org.apache.flink.table.catalog.FunctionCatalog
 import org.apache.flink.table.module.ModuleManager
 import org.apache.flink.table.operations.ModifyOperation
 import org.apache.flink.table.resource.ResourceManager
-import org.apache.flink.table.utils.{CatalogManagerMocks, ExecutorMock, PlannerMock}
+import org.apache.flink.table.utils.{CatalogManagerMocks, ExecutorMock, MaterializedTableExecutorFactoryMock, PlannerMock}
 import org.apache.flink.types.Row
 
 import org.assertj.core.api.Assertions.assertThat
@@ -85,7 +85,9 @@ class StreamTableEnvironmentImplTest {
       env,
       new TestPlanner(elements.getTransformation),
       new ExecutorMock,
-      true)
+      true,
+      new MaterializedTableExecutorFactoryMock,
+      null)
   }
 
   private class TestPlanner(transformation: Transformation[_]) extends PlannerMock {

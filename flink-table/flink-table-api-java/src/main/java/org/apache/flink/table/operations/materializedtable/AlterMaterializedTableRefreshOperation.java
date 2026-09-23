@@ -19,9 +19,12 @@
 package org.apache.flink.table.operations.materializedtable;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.internal.TableResultInternal;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.operations.OperationUtils;
+
+import javax.annotation.Nullable;
 
 import java.util.Map;
 
@@ -33,23 +36,81 @@ import java.util.Map;
 public class AlterMaterializedTableRefreshOperation extends AlterMaterializedTableOperation {
 
     private final Map<String, String> partitionSpec;
+    private final boolean isPeriodic;
+    private final @Nullable String scheduleTime;
+    private final Map<String, String> dynamicOptions;
 
     public AlterMaterializedTableRefreshOperation(
             ObjectIdentifier tableIdentifier, Map<String, String> partitionSpec) {
+        this(tableIdentifier, partitionSpec, false, null, Map.of());
+    }
+
+    private AlterMaterializedTableRefreshOperation(
+            ObjectIdentifier tableIdentifier,
+            Map<String, String> partitionSpec,
+            boolean isPeriodic,
+            @Nullable String scheduleTime,
+            Map<String, String> dynamicOptions) {
         super(tableIdentifier);
         this.partitionSpec = partitionSpec;
+        this.isPeriodic = isPeriodic;
+        this.scheduleTime = scheduleTime;
+        this.dynamicOptions = dynamicOptions;
+    }
+
+    /**
+     * A manual refresh of the given partitions, or of the whole table when {@code partitionSpec} is
+     * empty.
+     */
+    public static AlterMaterializedTableRefreshOperation oneTime(
+            ObjectIdentifier tableIdentifier,
+            Map<String, String> partitionSpec,
+            Map<String, String> dynamicOptions) {
+        return new AlterMaterializedTableRefreshOperation(
+                tableIdentifier, partitionSpec, false, null, dynamicOptions);
+    }
+
+    /**
+     * A refresh triggered by a workflow scheduler. It refreshes the partitions derived from the
+     * {@code scheduleTime} (format {@code yyyy-MM-dd HH:mm:ss}) and the table's freshness, so it
+     * takes no partition spec.
+     */
+    public static AlterMaterializedTableRefreshOperation periodic(
+            ObjectIdentifier tableIdentifier,
+            @Nullable String scheduleTime,
+            Map<String, String> dynamicOptions) {
+        if (scheduleTime == null) {
+            throw new ValidationException(
+                    String.format(
+                            "The scheduler time must not be null during the periodic refresh of the materialized table %s.",
+                            tableIdentifier));
+        }
+        return new AlterMaterializedTableRefreshOperation(
+                tableIdentifier, Map.of(), true, scheduleTime, dynamicOptions);
     }
 
     @Override
     public TableResultInternal execute(Context ctx) {
-        // execute AlterMaterializedTableRefreshOperation in SqlGateway OperationExecutor.
-        // see more at MaterializedTableManager#callAlterMaterializedTableRefreshOperation
+        // TableEnvironmentImpl#executeInternal routes every MaterializedTableOperation
+        // to the MaterializedTableExecutor before ExecutableOperation dispatch.
         throw new UnsupportedOperationException(
                 "AlterMaterializedTableRefreshOperation does not support ExecutableOperation yet.");
     }
 
     public Map<String, String> getPartitionSpec() {
         return partitionSpec;
+    }
+
+    public boolean isPeriodic() {
+        return isPeriodic;
+    }
+
+    public @Nullable String getScheduleTime() {
+        return scheduleTime;
+    }
+
+    public Map<String, String> getDynamicOptions() {
+        return dynamicOptions;
     }
 
     @Override

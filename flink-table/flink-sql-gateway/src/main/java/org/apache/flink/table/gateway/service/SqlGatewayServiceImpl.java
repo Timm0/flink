@@ -42,6 +42,7 @@ import org.apache.flink.table.gateway.api.results.TableInfo;
 import org.apache.flink.table.gateway.api.session.SessionEnvironment;
 import org.apache.flink.table.gateway.api.session.SessionHandle;
 import org.apache.flink.table.gateway.api.utils.SqlGatewayException;
+import org.apache.flink.table.gateway.service.operation.OperationExecutor;
 import org.apache.flink.table.gateway.service.operation.OperationManager;
 import org.apache.flink.table.gateway.service.session.Session;
 import org.apache.flink.table.gateway.service.session.SessionManager;
@@ -321,16 +322,19 @@ public class SqlGatewayServiceImpl implements SqlGatewayService {
             return getSession(sessionHandle)
                     .getOperationManager()
                     .submitOperation(
-                            handle ->
-                                    getSession(sessionHandle)
-                                            .createExecutor(Configuration.fromMap(executionConfig))
-                                            .refreshMaterializedTable(
-                                                    handle,
-                                                    materializedTableIdentifier,
-                                                    isPeriodic,
-                                                    scheduleTime,
-                                                    staticPartitions,
-                                                    dynamicOptions));
+                            handle -> {
+                                OperationExecutor executor =
+                                        getSession(sessionHandle)
+                                                .createExecutor(
+                                                        Configuration.fromMap(executionConfig));
+                                return executor.refreshMaterializedTable(
+                                        handle,
+                                        materializedTableIdentifier,
+                                        isPeriodic,
+                                        scheduleTime,
+                                        staticPartitions,
+                                        dynamicOptions);
+                            });
         } catch (Throwable t) {
             LOG.error("Failed to refresh MaterializedTable.", t);
             throw new SqlGatewayException("Failed to refresh MaterializedTable.", t);
@@ -355,6 +359,17 @@ public class SqlGatewayServiceImpl implements SqlGatewayService {
         Configuration mergedConfig = Configuration.fromMap(session.getSessionConfig());
         mergedConfig.addAll(executionConfig);
 
+        try {
+            return deployApplicationCluster(mergedConfig, scriptUri, script);
+        } catch (Throwable t) {
+            LOG.error("Failed to deploy script to cluster.", t);
+            throw new SqlGatewayException("Failed to deploy script to cluster.", t);
+        }
+    }
+
+    public static <ClusterID> ClusterID deployApplicationCluster(
+            Configuration mergedConfig, @Nullable URI scriptUri, @Nullable String script)
+            throws Exception {
         List<String> arguments = new ArrayList<>();
         if (scriptUri != null) {
             arguments.add("--" + SqlDriver.OPTION_SQL_FILE.getLongOpt());
@@ -368,13 +383,8 @@ public class SqlGatewayServiceImpl implements SqlGatewayService {
         ApplicationConfiguration applicationConfiguration =
                 new ApplicationConfiguration(
                         arguments.toArray(new String[0]), SqlDriver.class.getName());
-        try {
-            return new ApplicationClusterDeployer(new DefaultClusterClientServiceLoader())
-                    .run(mergedConfig, applicationConfiguration);
-        } catch (Throwable t) {
-            LOG.error("Failed to deploy script to cluster.", t);
-            throw new SqlGatewayException("Failed to deploy script to cluster.", t);
-        }
+        return new ApplicationClusterDeployer(new DefaultClusterClientServiceLoader())
+                .run(mergedConfig, applicationConfiguration);
     }
 
     @Override

@@ -46,6 +46,8 @@ import org.apache.flink.table.delegation.Executor;
 import org.apache.flink.table.delegation.ExecutorFactory;
 import org.apache.flink.table.delegation.Planner;
 import org.apache.flink.table.delegation.StreamExecutorFactory;
+import org.apache.flink.table.delegation.materializedtable.MaterializedTableExecutorFactory;
+import org.apache.flink.table.delegation.materializedtable.MaterializedTableJobSubmitter;
 import org.apache.flink.table.expressions.ApiExpressionUtils;
 import org.apache.flink.table.expressions.Expression;
 import org.apache.flink.table.factories.FactoryUtil;
@@ -85,7 +87,9 @@ public abstract class AbstractStreamTableEnvironmentImpl extends TableEnvironmen
             FunctionCatalog functionCatalog,
             Planner planner,
             boolean isStreamingMode,
-            StreamExecutionEnvironment executionEnvironment) {
+            StreamExecutionEnvironment executionEnvironment,
+            MaterializedTableExecutorFactory materializedTableExecutorFactory,
+            @Nullable MaterializedTableJobSubmitter materializedTableJobSubmitter) {
         super(
                 catalogManager,
                 moduleManager,
@@ -94,8 +98,18 @@ public abstract class AbstractStreamTableEnvironmentImpl extends TableEnvironmen
                 executor,
                 functionCatalog,
                 planner,
-                isStreamingMode);
+                isStreamingMode,
+                materializedTableExecutorFactory,
+                materializedTableJobSubmitter);
         this.executionEnvironment = executionEnvironment;
+    }
+
+    public static MaterializedTableExecutorFactory lookupMaterializedTableExecutorFactory(
+            ClassLoader classLoader) {
+        return FactoryUtil.discoverFactory(
+                classLoader,
+                MaterializedTableExecutorFactory.class,
+                MaterializedTableExecutorFactory.DEFAULT_IDENTIFIER);
     }
 
     public static Executor lookupExecutor(

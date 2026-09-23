@@ -27,6 +27,8 @@ import org.apache.flink.table.api.bridge.scala.{StreamStatementSet, StreamTableE
 import org.apache.flink.table.catalog._
 import org.apache.flink.table.connector.ChangelogMode
 import org.apache.flink.table.delegation.{Executor, Planner}
+import org.apache.flink.table.delegation.materializedtable.MaterializedTableExecutorFactory
+import org.apache.flink.table.delegation.materializedtable.MaterializedTableJobSubmitter
 import org.apache.flink.table.expressions.Expression
 import org.apache.flink.table.factories.{ApiFactoryUtil, PlannerFactoryUtil, TableFactoryUtil}
 import org.apache.flink.table.functions.{AggregateFunction, TableAggregateFunction, TableFunction, UserDefinedFunctionHelper}
@@ -59,7 +61,9 @@ class StreamTableEnvironmentImpl(
     executionEnvironment: StreamExecutionEnvironment,
     planner: Planner,
     executor: Executor,
-    isStreaming: Boolean)
+    isStreaming: Boolean,
+    materializedTableExecutorFactory: MaterializedTableExecutorFactory,
+    materializedTableJobSubmitter: MaterializedTableJobSubmitter)
   extends AbstractStreamTableEnvironmentImpl(
     catalogManager,
     moduleManager,
@@ -69,7 +73,9 @@ class StreamTableEnvironmentImpl(
     functionCatalog,
     planner,
     isStreaming,
-    executionEnvironment)
+    executionEnvironment,
+    materializedTableExecutorFactory,
+    materializedTableJobSubmitter)
   with StreamTableEnvironment {
 
   override def fromDataStream[T](dataStream: DataStream[T]): Table = {
@@ -294,6 +300,9 @@ object StreamTableEnvironmentImpl {
       catalogManager,
       functionCatalog)
 
+    val materializedTableExecutorFactory =
+      AbstractStreamTableEnvironmentImpl.lookupMaterializedTableExecutorFactory(userClassLoader)
+
     new StreamTableEnvironmentImpl(
       catalogManager,
       moduleManager,
@@ -303,7 +312,9 @@ object StreamTableEnvironmentImpl {
       executionEnvironment,
       planner,
       executor,
-      settings.isStreamingMode
+      settings.isStreamingMode,
+      materializedTableExecutorFactory,
+      null
     )
   }
 }

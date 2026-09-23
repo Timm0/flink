@@ -21,6 +21,8 @@ package org.apache.flink.table.gateway.service;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.client.program.rest.RestClusterClient;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.DeploymentOptions;
+import org.apache.flink.configuration.PipelineOptionsInternal;
 import org.apache.flink.core.testutils.CommonTestUtils;
 import org.apache.flink.runtime.rest.messages.EmptyRequestBody;
 import org.apache.flink.runtime.rest.messages.JobMessageParameters;
@@ -33,6 +35,7 @@ import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointingStatistic
 import org.apache.flink.runtime.rest.messages.checkpoints.CheckpointingStatisticsHeaders;
 import org.apache.flink.runtime.rest.util.RestMapperUtils;
 import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.catalog.CatalogMaterializedTable.LogicalRefreshMode;
 import org.apache.flink.table.catalog.CatalogMaterializedTable.RefreshMode;
@@ -45,10 +48,12 @@ import org.apache.flink.table.catalog.ResolvedCatalogMaterializedTable;
 import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.catalog.TableDistribution;
 import org.apache.flink.table.catalog.TableDistribution.Kind;
+import org.apache.flink.table.data.MapData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.gateway.AbstractMaterializedTableStatementITCase;
 import org.apache.flink.table.gateway.api.operation.OperationHandle;
 import org.apache.flink.table.gateway.api.utils.SqlGatewayException;
+import org.apache.flink.table.gateway.rest.DeployScriptITCase;
 import org.apache.flink.table.gateway.service.utils.SqlExecutionException;
 import org.apache.flink.table.gateway.workflow.EmbeddedRefreshHandler;
 import org.apache.flink.table.gateway.workflow.EmbeddedRefreshHandlerSerializer;
@@ -56,6 +61,7 @@ import org.apache.flink.table.gateway.workflow.WorkflowInfo;
 import org.apache.flink.table.gateway.workflow.scheduler.EmbeddedQuartzScheduler;
 import org.apache.flink.table.refresh.ContinuousRefreshHandler;
 import org.apache.flink.table.refresh.ContinuousRefreshHandlerSerializer;
+import org.apache.flink.table.runtime.application.SqlDriver;
 import org.apache.flink.types.Row;
 
 import org.junit.jupiter.api.AfterEach;
@@ -439,6 +445,42 @@ class MaterializedTableStatementITCase extends AbstractMaterializedTableStatemen
     }
 
     @Test
+    void testCreateMaterializedTableInFullModeViaConfigureSession() throws Exception {
+        createBoundedValuesSource(List.of());
+
+        String materializedTableDDL =
+                "CREATE MATERIALIZED TABLE users_shops"
+                        + " PARTITIONED BY (ds)\n"
+                        + " WITH(\n"
+                        + "    'partition.fields.ds.date-formatter' = 'yyyy-MM-dd',\n"
+                        + "   'format' = 'debezium-json'\n"
+                        + " )\n"
+                        + " FRESHNESS = INTERVAL '1' MINUTE\n"
+                        + " REFRESH_MODE = FULL\n"
+                        + " AS SELECT \n"
+                        + "  user_id,\n"
+                        + "  shop_id,\n"
+                        + "  ds,\n"
+                        + "  COUNT(order_id) AS order_cnt\n"
+                        + " FROM (\n"
+                        + "    SELECT user_id, shop_id, order_created_at AS ds, order_id FROM my_source"
+                        + " ) AS tmp\n"
+                        + " GROUP BY (user_id, shop_id, ds)";
+        service.configureSession(sessionHandle, materializedTableDDL, -1);
+
+        ObjectIdentifier userShopsIdentifier = getObjectIdentifier("users_shops");
+        ResolvedCatalogMaterializedTable actualMaterializedTable = getTable(userShopsIdentifier);
+        assertThat(actualMaterializedTable.getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
+
+        EmbeddedRefreshHandler embeddedRefreshHandler =
+                EmbeddedRefreshHandlerSerializer.INSTANCE.deserialize(
+                        actualMaterializedTable.getSerializedRefreshHandler(),
+                        getClass().getClassLoader());
+        assertThat(embeddedRefreshHandler.getWorkflowName())
+                .isEqualTo("quartz_job_" + userShopsIdentifier.asSerializableString());
+    }
+
+    @Test
     void testCreateMaterializedTableFailedInInContinuousMode() {
         // create a materialized table with invalid SQL
         String materializedTableDDL =
@@ -819,7 +861,7 @@ class MaterializedTableStatementITCase extends AbstractMaterializedTableStatemen
                                         sessionHandle,
                                         repeatedAlterMaterializedTableSuspendHandle))
                 .rootCause()
-                .isInstanceOf(SqlExecutionException.class)
+                .isInstanceOf(TableException.class)
                 .hasMessageContaining(
                         String.format(
                                 "Materialized table %s continuous refresh job has been suspended",
@@ -841,7 +883,7 @@ class MaterializedTableStatementITCase extends AbstractMaterializedTableStatemen
                                         sessionHandle,
                                         repeatedAlterMaterializedTableResumeHandle))
                 .rootCause()
-                .isInstanceOf(SqlExecutionException.class)
+                .isInstanceOf(TableException.class)
                 .hasMessageContaining(
                         String.format(
                                 "Materialized table %s continuous refresh job has been resumed",
@@ -950,7 +992,7 @@ class MaterializedTableStatementITCase extends AbstractMaterializedTableStatemen
                                         sessionHandle,
                                         repeatedAlterMaterializedTableSuspendHandle))
                 .rootCause()
-                .isInstanceOf(SqlExecutionException.class)
+                .isInstanceOf(TableException.class)
                 .hasMessageContaining(
                         String.format(
                                 "Materialized table %s refresh workflow has been suspended.",
@@ -973,7 +1015,7 @@ class MaterializedTableStatementITCase extends AbstractMaterializedTableStatemen
                                         sessionHandle,
                                         repeatedAlterMaterializedTableResumeHandle))
                 .rootCause()
-                .isInstanceOf(SqlExecutionException.class)
+                .isInstanceOf(TableException.class)
                 .hasMessageContaining(
                         String.format(
                                 "Materialized table %s refresh workflow has been resumed.",
@@ -1705,6 +1747,96 @@ class MaterializedTableStatementITCase extends AbstractMaterializedTableStatemen
     }
 
     @Test
+    void testRefreshMaterializedTableAppliesDynamicOptionsToTheSink() throws Exception {
+        createAndVerifyCreateMaterializedTableWithData(
+                "users_shops", List.of(), Map.of(), RefreshMode.CONTINUOUS);
+        ObjectIdentifier objectIdentifier = getObjectIdentifier("users_shops");
+
+        OperationHandle refreshTableHandle =
+                service.refreshMaterializedTable(
+                        sessionHandle,
+                        objectIdentifier.asSerializableString(),
+                        false,
+                        null,
+                        Map.of("unsupported-dynamic-option", "value"),
+                        Map.of(),
+                        Map.of());
+
+        assertThatThrownBy(
+                        () -> awaitOperationTermination(service, sessionHandle, refreshTableHandle))
+                .rootCause()
+                .hasMessageContaining("Unsupported options")
+                .hasMessageContaining("unsupported-dynamic-option");
+    }
+
+    @Test
+    void testCreateAndRefreshMaterializedTableInApplicationMode() throws Exception {
+        String applicationTarget = "kubernetes-application";
+        DeployScriptITCase.TestApplicationClusterClientFactory.id = applicationTarget;
+        try {
+            Configuration applicationModeConfig = new Configuration();
+            applicationModeConfig.set(DeploymentOptions.TARGET, applicationTarget);
+
+            OperationHandle createHandle =
+                    executeStatement(
+                            "CREATE MATERIALIZED TABLE app_mode_mt\n"
+                                    + " WITH ('format' = 'debezium-json')\n"
+                                    + " FRESHNESS = INTERVAL '30' SECOND\n"
+                                    + " AS SELECT user_id, shop_id, COUNT(*) AS cnt"
+                                    + " FROM datagenSource GROUP BY user_id, shop_id",
+                            -1,
+                            applicationModeConfig);
+            awaitOperationTermination(service, sessionHandle, createHandle);
+
+            ObjectIdentifier identifier = getObjectIdentifier("app_mode_mt");
+            ContinuousRefreshHandler refreshHandler =
+                    getContinuousRefreshHandler(getTable(identifier));
+            assertThat(refreshHandler.getExecutionTarget()).isEqualTo(applicationTarget);
+            assertThat(refreshHandler.getClusterId()).isEqualTo("test");
+            assertThat(
+                            DeployScriptITCase.TestApplicationClusterClientFactory.configuration
+                                    .get(PipelineOptionsInternal.PIPELINE_FIXED_JOB_ID))
+                    .isEqualTo(refreshHandler.getJobId());
+            assertThat(
+                            SqlDriver.parseOptions(
+                                    DeployScriptITCase.TestApplicationClusterDescriptor
+                                            .applicationConfiguration
+                                            .getProgramArguments()))
+                    .startsWith("INSERT INTO")
+                    .contains(identifier.asSerializableString());
+
+            OperationHandle refreshHandle =
+                    service.refreshMaterializedTable(
+                            sessionHandle,
+                            identifier.asSerializableString(),
+                            false,
+                            null,
+                            Map.of(),
+                            Map.of(),
+                            applicationModeConfig.toMap());
+            awaitOperationTermination(service, sessionHandle, refreshHandle);
+
+            MapData clusterInfo =
+                    fetchAllResults(service, sessionHandle, refreshHandle).get(0).getMap(1);
+            Map<String, String> clusterInfoByKey = new HashMap<>();
+            for (int i = 0; i < clusterInfo.size(); i++) {
+                clusterInfoByKey.put(
+                        clusterInfo.keyArray().getString(i).toString(),
+                        clusterInfo.valueArray().getString(i).toString());
+            }
+            assertThat(clusterInfoByKey)
+                    .isEqualTo(
+                            Map.of(
+                                    "execution.target",
+                                    applicationTarget,
+                                    "kubernetes.cluster-id",
+                                    "test"));
+        } finally {
+            DeployScriptITCase.TestApplicationClusterClientFactory.id = null;
+        }
+    }
+
+    @Test
     void testPeriodicRefreshMaterializedTableWithoutPartitionOptions() throws Exception {
         List<Row> data = new ArrayList<>();
         data.add(Row.of(1L, 1L, 1L, "2024-01-01"));
@@ -1870,7 +2002,7 @@ class MaterializedTableStatementITCase extends AbstractMaterializedTableStatemen
                                 awaitOperationTermination(
                                         service, sessionHandle, invalidRefreshTableHandle2))
                 .rootCause()
-                .isInstanceOf(SqlExecutionException.class)
+                .isInstanceOf(TableException.class)
                 .hasMessage(
                         String.format(
                                 "Failed to parse a valid partition value for the field 'ds' in materialized table %s using the scheduler time '20240103 00:00:00.000' based on the date format 'yyyy-MM-dd HH:mm:ss'.",

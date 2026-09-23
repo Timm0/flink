@@ -58,6 +58,7 @@ import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.delegation.Executor;
 import org.apache.flink.table.delegation.ExecutorFactory;
 import org.apache.flink.table.delegation.Planner;
+import org.apache.flink.table.delegation.materializedtable.MaterializedTableJobSubmitter;
 import org.apache.flink.table.factories.FactoryUtil;
 import org.apache.flink.table.factories.PlannerFactoryUtil;
 import org.apache.flink.table.functions.FunctionDefinition;
@@ -67,6 +68,7 @@ import org.apache.flink.table.gateway.api.results.FunctionInfo;
 import org.apache.flink.table.gateway.api.results.TableInfo;
 import org.apache.flink.table.gateway.environment.SqlGatewayStreamExecutionEnvironment;
 import org.apache.flink.table.gateway.service.context.SessionContext;
+import org.apache.flink.table.gateway.service.materializedtable.GatewayMaterializedTableJobSubmitter;
 import org.apache.flink.table.gateway.service.result.ResultFetcher;
 import org.apache.flink.table.gateway.service.utils.SqlExecutionException;
 import org.apache.flink.table.module.ModuleManager;
@@ -120,6 +122,7 @@ import org.apache.flink.table.operations.ddl.DropTableOperation;
 import org.apache.flink.table.operations.ddl.DropTempSystemFunctionOperation;
 import org.apache.flink.table.operations.ddl.DropViewOperation;
 import org.apache.flink.table.operations.materializedtable.AlterMaterializedTableOperation;
+import org.apache.flink.table.operations.materializedtable.AlterMaterializedTableRefreshOperation;
 import org.apache.flink.table.operations.materializedtable.CreateMaterializedTableOperation;
 import org.apache.flink.table.operations.materializedtable.DropMaterializedTableOperation;
 import org.apache.flink.table.operations.materializedtable.MaterializedTableOperation;
@@ -202,7 +205,11 @@ public class OperationExecutor {
     }
 
     public ResultFetcher configureSession(OperationHandle handle, String statement) {
-        TableEnvironmentInternal tableEnv = getTableEnvironment();
+        TableEnvironmentInternal tableEnv =
+                getTableEnvironment(
+                        sessionContext.getSessionState().resourceManager,
+                        new Configuration(),
+                        handle);
         List<Operation> parsedOperations = tableEnv.getParser().parse(statement);
         if (parsedOperations.size() > 1) {
             throw new UnsupportedOperationException(
@@ -237,7 +244,8 @@ public class OperationExecutor {
             OperationHandle handle, Configuration customConfig, String statement) {
         // Instantiate the TableEnvironment lazily
         ResourceManager resourceManager = sessionContext.getSessionState().resourceManager.copy();
-        TableEnvironmentInternal tableEnv = getTableEnvironment(resourceManager, customConfig);
+        TableEnvironmentInternal tableEnv =
+                getTableEnvironment(resourceManager, customConfig, handle);
         PlanCacheManager planCacheManager = sessionContext.getPlanCacheManager();
         CachedPlan cachedPlan = null;
         Operation op = null;
@@ -405,6 +413,13 @@ public class OperationExecutor {
 
     public TableEnvironmentInternal getTableEnvironment(
             ResourceManager resourceManager, Configuration customConfig) {
+        return getTableEnvironment(resourceManager, customConfig, null);
+    }
+
+    public TableEnvironmentInternal getTableEnvironment(
+            ResourceManager resourceManager,
+            Configuration customConfig,
+            @Nullable OperationHandle handle) {
         // checks the value of RUNTIME_MODE
         Configuration operationConfig = sessionContext.getSessionConf().clone();
         operationConfig.addAll(executionConfig);
@@ -421,6 +436,15 @@ public class OperationExecutor {
 
         final Executor executor =
                 lookupExecutor(streamExecEnv, sessionContext.getUserClassloader());
+
+        final MaterializedTableJobSubmitter customMaterializedTableJobSubmitter =
+                handle != null
+                        ? new GatewayMaterializedTableJobSubmitter(
+                                this,
+                                handle,
+                                sessionContext.getSessionState().materializedTableContext)
+                        : null;
+
         return createStreamTableEnvironment(
                 streamExecEnv,
                 settings,
@@ -429,7 +453,8 @@ public class OperationExecutor {
                 sessionContext.getSessionState().catalogManager,
                 sessionContext.getSessionState().moduleManager,
                 resourceManager,
-                sessionContext.getSessionState().functionCatalog.copy(resourceManager));
+                sessionContext.getSessionState().functionCatalog.copy(resourceManager),
+                customMaterializedTableJobSubmitter);
     }
 
     public <ClusterID> Optional<String> getSessionClusterId() {
@@ -469,7 +494,8 @@ public class OperationExecutor {
             CatalogManager catalogManager,
             ModuleManager moduleManager,
             ResourceManager resourceManager,
-            FunctionCatalog functionCatalog) {
+            FunctionCatalog functionCatalog,
+            @Nullable MaterializedTableJobSubmitter customMaterializedTableJobSubmitter) {
 
         final Planner planner =
                 PlannerFactoryUtil.createPlanner(
@@ -489,7 +515,9 @@ public class OperationExecutor {
                 env,
                 planner,
                 executor,
-                settings.isStreamingMode());
+                settings.isStreamingMode(),
+                sessionContext.getSessionState().materializedTableExecutorFactory,
+                customMaterializedTableJobSubmitter);
     }
 
     private ResultFetcher executeOperationInStatementSetState(
@@ -555,11 +583,6 @@ public class OperationExecutor {
                 || op instanceof ShowFunctionsOperation
                 || op instanceof DescribeFunctionOperation) {
             return callExecutableOperation(handle, (ExecutableOperation) op);
-        } else if (op instanceof MaterializedTableOperation) {
-            return sessionContext
-                    .getSessionState()
-                    .materializedTableManager
-                    .callMaterializedTableOperation(this, handle, (MaterializedTableOperation) op);
         } else {
             return callOperation(tableEnv, handle, op);
         }
@@ -585,22 +608,22 @@ public class OperationExecutor {
             @Nullable String scheduleTime,
             Map<String, String> staticPartitions,
             Map<String, String> dynamicOptions) {
-        TableEnvironmentInternal tEnv = getTableEnvironment();
+        TableEnvironmentInternal tEnv =
+                getTableEnvironment(
+                        sessionContext.getSessionState().resourceManager,
+                        new Configuration(),
+                        handle);
         UnresolvedIdentifier unresolvedIdentifier =
                 tEnv.getParser().parseIdentifier(materializedTableIdentifier);
         ObjectIdentifier objectIdentifier =
                 tEnv.getCatalogManager().qualifyIdentifier(unresolvedIdentifier);
-        return sessionContext
-                .getSessionState()
-                .materializedTableManager
-                .refreshMaterializedTable(
-                        this,
-                        handle,
-                        objectIdentifier,
-                        staticPartitions,
-                        dynamicOptions,
-                        isPeriodic,
-                        scheduleTime);
+        AlterMaterializedTableRefreshOperation refreshOperation =
+                isPeriodic
+                        ? AlterMaterializedTableRefreshOperation.periodic(
+                                objectIdentifier, scheduleTime, dynamicOptions)
+                        : AlterMaterializedTableRefreshOperation.oneTime(
+                                objectIdentifier, staticPartitions, dynamicOptions);
+        return callOperation(tEnv, handle, refreshOperation);
     }
 
     private TableConfig tableConfig() {

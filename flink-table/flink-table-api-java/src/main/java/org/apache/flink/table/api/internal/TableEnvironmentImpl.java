@@ -47,6 +47,7 @@ import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.api.TableResult;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.config.TableConfigOptions;
+import org.apache.flink.table.api.internal.materializedtable.DefaultMaterializedTableJobSubmitter;
 import org.apache.flink.table.catalog.Catalog;
 import org.apache.flink.table.catalog.CatalogBaseTable;
 import org.apache.flink.table.catalog.CatalogDescriptor;
@@ -76,6 +77,9 @@ import org.apache.flink.table.delegation.ExecutorFactory;
 import org.apache.flink.table.delegation.InternalPlan;
 import org.apache.flink.table.delegation.Parser;
 import org.apache.flink.table.delegation.Planner;
+import org.apache.flink.table.delegation.materializedtable.MaterializedTableExecutor;
+import org.apache.flink.table.delegation.materializedtable.MaterializedTableExecutorFactory;
+import org.apache.flink.table.delegation.materializedtable.MaterializedTableJobSubmitter;
 import org.apache.flink.table.execution.StagingSinkJobStatusHook;
 import org.apache.flink.table.expressions.ApiExpressionUtils;
 import org.apache.flink.table.expressions.DefaultSqlFactory;
@@ -115,6 +119,7 @@ import org.apache.flink.table.operations.command.ExecutePlanOperation;
 import org.apache.flink.table.operations.ddl.AnalyzeTableOperation;
 import org.apache.flink.table.operations.ddl.CompilePlanOperation;
 import org.apache.flink.table.operations.ddl.CreateTableOperation;
+import org.apache.flink.table.operations.materializedtable.MaterializedTableOperation;
 import org.apache.flink.table.operations.utils.ExecutableOperationUtils;
 import org.apache.flink.table.operations.utils.OperationTreeBuilder;
 import org.apache.flink.table.resource.ResourceManager;
@@ -131,6 +136,8 @@ import org.apache.flink.types.Row;
 import org.apache.flink.util.FlinkUserCodeClassLoaders;
 import org.apache.flink.util.MutableURLClassLoader;
 import org.apache.flink.util.Preconditions;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.net.URL;
@@ -173,6 +180,10 @@ public class TableEnvironmentImpl implements TableEnvironmentInternal {
     private final boolean isStreamingMode;
     private final ExecutableOperation.Context operationCtx;
 
+    private final MaterializedTableExecutorFactory materializedTableExecutorFactory;
+    private @Nullable MaterializedTableExecutor materializedTableExecEnv;
+    private final @Nullable MaterializedTableJobSubmitter customMaterializedTableJobSubmitter;
+
     private static final String UNSUPPORTED_QUERY_IN_EXECUTE_SQL_MSG =
             "Unsupported SQL query! executeSql() only accepts a single SQL statement of type "
                     + "CREATE TABLE, DROP TABLE, ALTER TABLE, CREATE DATABASE, DROP DATABASE, ALTER DATABASE, "
@@ -191,7 +202,9 @@ public class TableEnvironmentImpl implements TableEnvironmentInternal {
             Executor executor,
             FunctionCatalog functionCatalog,
             Planner planner,
-            boolean isStreamingMode) {
+            boolean isStreamingMode,
+            MaterializedTableExecutorFactory materializedTableExecutorFactory,
+            @Nullable MaterializedTableJobSubmitter materializedTableJobSubmitter) {
         this.catalogManager = catalogManager;
         this.moduleManager = moduleManager;
         this.resourceManager = resourceManager;
@@ -239,6 +252,8 @@ public class TableEnvironmentImpl implements TableEnvironmentInternal {
                         resourceManager,
                         tableConfig,
                         isStreamingMode);
+        this.materializedTableExecutorFactory = materializedTableExecutorFactory;
+        this.customMaterializedTableJobSubmitter = materializedTableJobSubmitter;
     }
 
     public static TableEnvironmentImpl create(Configuration configuration) {
@@ -318,6 +333,12 @@ public class TableEnvironmentImpl implements TableEnvironmentInternal {
                         catalogManager,
                         functionCatalog);
 
+        final MaterializedTableExecutorFactory materializedTableExecutorFactory =
+                FactoryUtil.discoverFactory(
+                        userClassLoader,
+                        MaterializedTableExecutorFactory.class,
+                        MaterializedTableExecutorFactory.DEFAULT_IDENTIFIER);
+
         return new TableEnvironmentImpl(
                 catalogManager,
                 moduleManager,
@@ -326,7 +347,9 @@ public class TableEnvironmentImpl implements TableEnvironmentInternal {
                 executor,
                 functionCatalog,
                 planner,
-                settings.isStreamingMode());
+                settings.isStreamingMode(),
+                materializedTableExecutorFactory,
+                null);
     }
 
     @Override
@@ -1312,8 +1335,25 @@ public class TableEnvironmentImpl implements TableEnvironmentInternal {
         }
     }
 
+    private MaterializedTableExecutor getMaterializedTableExecEnv() {
+        if (materializedTableExecEnv == null) {
+            final MaterializedTableJobSubmitter jobSubmitter =
+                    customMaterializedTableJobSubmitter != null
+                            ? customMaterializedTableJobSubmitter
+                            : new DefaultMaterializedTableJobSubmitter(
+                                    operationCtx, planner, execEnv);
+            materializedTableExecEnv =
+                    materializedTableExecutorFactory.createExecutor(operationCtx, jobSubmitter);
+        }
+        return materializedTableExecEnv;
+    }
+
     @Override
     public TableResultInternal executeInternal(Operation operation) {
+        if (operation instanceof MaterializedTableOperation) {
+            return getMaterializedTableExecEnv().execute((MaterializedTableOperation) operation);
+        }
+
         // delegate execution to Operation if it implements ExecutableOperation
         if (operation instanceof ExecutableOperation) {
             return ((ExecutableOperation) operation).execute(operationCtx);

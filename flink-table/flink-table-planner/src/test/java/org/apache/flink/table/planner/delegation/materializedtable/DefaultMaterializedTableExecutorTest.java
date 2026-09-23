@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-package org.apache.flink.table.gateway.service.materializedtable;
+package org.apache.flink.table.planner.delegation.materializedtable;
 
 import org.apache.flink.table.catalog.IntervalFreshness;
 import org.apache.flink.table.catalog.ObjectIdentifier;
@@ -28,7 +28,6 @@ import org.junit.jupiter.params.provider.MethodSource;
 import javax.annotation.Nullable;
 
 import java.time.ZoneId;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -37,8 +36,8 @@ import java.util.stream.Stream;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Test for {@link MaterializedTableManager}. */
-class MaterializedTableManagerTest {
+/** Test for the {@link DefaultMaterializedTableExecutor}. */
+class DefaultMaterializedTableExecutorTest {
 
     @Test
     void testGetManuallyRefreshStatement() {
@@ -46,11 +45,8 @@ class MaterializedTableManagerTest {
                 ObjectIdentifier.of("catalog", "database", "my_materialized_table");
         String query = "SELECT * FROM my_source_table";
         assertThat(
-                        MaterializedTableManager.getRefreshStatement(
-                                tableIdentifier,
-                                query,
-                                Collections.emptyMap(),
-                                Collections.emptyMap()))
+                        DefaultMaterializedTableExecutor.getRefreshStatement(
+                                tableIdentifier, query, Map.of(), Map.of()))
                 .isEqualTo(
                         "INSERT OVERWRITE `catalog`.`database`.`my_materialized_table`\n"
                                 + "  SELECT * FROM (SELECT * FROM my_source_table)");
@@ -59,10 +55,52 @@ class MaterializedTableManagerTest {
         partitionSpec.put("k1", "v1");
         partitionSpec.put("k2", "v2");
         assertThat(
-                        MaterializedTableManager.getRefreshStatement(
-                                tableIdentifier, query, partitionSpec, Collections.emptyMap()))
+                        DefaultMaterializedTableExecutor.getRefreshStatement(
+                                tableIdentifier, query, partitionSpec, Map.of()))
                 .isEqualTo(
                         "INSERT OVERWRITE `catalog`.`database`.`my_materialized_table`\n"
+                                + "  SELECT * FROM (SELECT * FROM my_source_table)\n"
+                                + "  WHERE k1 = 'v1' AND k2 = 'v2'");
+    }
+
+    @Test
+    void testGetRefreshStatementWithDynamicOptions() {
+        ObjectIdentifier tableIdentifier =
+                ObjectIdentifier.of("catalog", "database", "my_materialized_table");
+        String query = "SELECT * FROM my_source_table";
+
+        // Dynamic options render as an OPTIONS hint on the target table.
+        Map<String, String> dynamicOptions = new LinkedHashMap<>();
+        dynamicOptions.put("option1", "value1");
+        dynamicOptions.put("option2", "value2");
+        assertThat(
+                        DefaultMaterializedTableExecutor.getRefreshStatement(
+                                tableIdentifier, query, Map.of(), dynamicOptions))
+                .isEqualTo(
+                        "INSERT OVERWRITE `catalog`.`database`.`my_materialized_table` "
+                                + "/*+ OPTIONS('option1'='value1', 'option2'='value2') */\n"
+                                + "  SELECT * FROM (SELECT * FROM my_source_table)");
+    }
+
+    @Test
+    void testGetRefreshStatementWithPartitionSpecAndDynamicOptions() {
+        ObjectIdentifier tableIdentifier =
+                ObjectIdentifier.of("catalog", "database", "my_materialized_table");
+        String query = "SELECT * FROM my_source_table";
+
+        Map<String, String> partitionSpec = new LinkedHashMap<>();
+        partitionSpec.put("k1", "v1");
+        partitionSpec.put("k2", "v2");
+        Map<String, String> dynamicOptions = new LinkedHashMap<>();
+        dynamicOptions.put("option1", "value1");
+
+        // The OPTIONS hint and the partition WHERE clause combine.
+        assertThat(
+                        DefaultMaterializedTableExecutor.getRefreshStatement(
+                                tableIdentifier, query, partitionSpec, dynamicOptions))
+                .isEqualTo(
+                        "INSERT OVERWRITE `catalog`.`database`.`my_materialized_table` "
+                                + "/*+ OPTIONS('option1'='value1') */\n"
                                 + "  SELECT * FROM (SELECT * FROM my_source_table)\n"
                                 + "  WHERE k1 = 'v1' AND k2 = 'v2'");
     }
@@ -77,8 +115,8 @@ class MaterializedTableManagerTest {
                 "INSERT INTO `catalog`.`database`.`table`\n" + "SELECT * FROM source_table";
 
         String actualStatement =
-                MaterializedTableManager.getInsertStatement(
-                        materializedTableIdentifier, definitionQuery, Collections.emptyMap());
+                DefaultMaterializedTableExecutor.getInsertStatement(
+                        materializedTableIdentifier, definitionQuery, Map.of());
 
         assertThat(actualStatement).isEqualTo(expectedStatement);
     }
@@ -98,7 +136,7 @@ class MaterializedTableManagerTest {
                         + "SELECT * FROM source_table";
 
         String actualStatement =
-                MaterializedTableManager.getInsertStatement(
+                DefaultMaterializedTableExecutor.getInsertStatement(
                         materializedTableIdentifier, definitionQuery, dynamicOptions);
         assertThat(actualStatement).isEqualTo(expectedStatement);
     }
@@ -110,7 +148,7 @@ class MaterializedTableManagerTest {
 
         if (testSpec.errorMessage == null) {
             Map<String, String> actualRefreshPartition =
-                    MaterializedTableManager.getPeriodRefreshPartition(
+                    DefaultMaterializedTableExecutor.getPeriodRefreshPartition(
                             testSpec.schedulerTime,
                             testSpec.freshness,
                             objectIdentifier,
@@ -121,7 +159,7 @@ class MaterializedTableManagerTest {
         } else {
             assertThatThrownBy(
                             () ->
-                                    MaterializedTableManager.getPeriodRefreshPartition(
+                                    DefaultMaterializedTableExecutor.getPeriodRefreshPartition(
                                             testSpec.schedulerTime,
                                             testSpec.freshness,
                                             objectIdentifier,
