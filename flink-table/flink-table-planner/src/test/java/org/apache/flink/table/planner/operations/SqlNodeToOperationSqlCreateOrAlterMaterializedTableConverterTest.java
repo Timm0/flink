@@ -45,6 +45,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
@@ -674,6 +675,52 @@ class SqlNodeToOperationSqlCreateOrAlterMaterializedTableConverterTest
                         StartMode.of(
                                 StartModeKind.RESUME_OR_FROM_TIMESTAMP,
                                 Instant.parse("2025-01-15T10:00:00Z"))));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("startModeFactoryCases")
+    void testStartModeFactoriesMatchSqlClause(String startModeClause, StartMode factoryStartMode) {
+        final String sql =
+                "CREATE MATERIALIZED TABLE mt_start_mode\n"
+                        + "START_MODE = "
+                        + startModeClause
+                        + "\n"
+                        + "AS SELECT * FROM t1";
+
+        assertThat(
+                        createMaterializedTableOperation(sql)
+                                .getCatalogMaterializedTable()
+                                .getStartMode())
+                .contains(factoryStartMode);
+    }
+
+    private static Collection<Arguments> startModeFactoryCases() {
+        final Instant timestamp = Instant.parse("2025-01-15T10:00:00Z");
+        return List.of(
+                Arguments.of("FROM_BEGINNING", StartMode.fromBeginning()),
+                Arguments.of("FROM_NOW", StartMode.fromNow()),
+                Arguments.of(
+                        "FROM_TIMESTAMP(TIMESTAMP '2025-01-15 10:00:00')",
+                        StartMode.fromTimestamp(timestamp)),
+                Arguments.of(
+                        "FROM_TIMESTAMP(TIMESTAMP '2025-01-15 10:00:00.123')",
+                        StartMode.fromTimestamp(Instant.parse("2025-01-15T10:00:00.123456789Z"))),
+                Arguments.of("RESUME_OR_FROM_BEGINNING", StartMode.resumeOrFromBeginning()),
+                Arguments.of("RESUME_OR_FROM_NOW", StartMode.resumeOrFromNow()),
+                Arguments.of(
+                        "RESUME_OR_FROM_TIMESTAMP(TIMESTAMP '2025-01-15 10:00:00')",
+                        StartMode.resumeOrFromTimestamp(timestamp)),
+                Arguments.of("FROM_NOW(INTERVAL '1' DAY)", StartMode.fromNow(Duration.ofDays(1))),
+                Arguments.of(
+                        "FROM_NOW(INTERVAL '36' HOUR)", StartMode.fromNow(Duration.ofHours(36))),
+                Arguments.of(
+                        "FROM_NOW(INTERVAL '1' HOUR)", StartMode.fromNow(Duration.ofMinutes(60))),
+                Arguments.of(
+                        "RESUME_OR_FROM_NOW(INTERVAL '90' MINUTE)",
+                        StartMode.resumeOrFromNow(Duration.ofMinutes(90))),
+                Arguments.of(
+                        "RESUME_OR_FROM_NOW(INTERVAL '90' SECOND)",
+                        StartMode.resumeOrFromNow(Duration.ofSeconds(90))));
     }
 
     private void createMaterializedTableInCatalog(String sql, String materializedTableName)
