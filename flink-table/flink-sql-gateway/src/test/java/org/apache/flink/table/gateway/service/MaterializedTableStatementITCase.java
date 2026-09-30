@@ -88,6 +88,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.configuration.CheckpointingOptions.CHECKPOINTING_INTERVAL;
+import static org.apache.flink.configuration.CheckpointingOptions.SAVEPOINT_DIRECTORY;
 import static org.apache.flink.table.api.config.TableConfigOptions.RESOURCES_DOWNLOAD_DIR;
 import static org.apache.flink.table.factories.FactoryUtil.WORKFLOW_SCHEDULER_TYPE;
 import static org.apache.flink.table.gateway.service.utils.SqlGatewayServiceTestUtil.awaitOperationTermination;
@@ -106,6 +107,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * with the code in {@link SqlGatewayServiceITCase}.
  */
 class MaterializedTableStatementITCase extends AbstractMaterializedTableStatementITCase {
+
+    private static final String APPLICATION_TARGET = "kubernetes-application";
 
     @AfterEach
     void tearDown() throws Exception {
@@ -798,7 +801,7 @@ class MaterializedTableStatementITCase extends AbstractMaterializedTableStatemen
                 .rootCause()
                 .isInstanceOf(ValidationException.class)
                 .hasMessageContaining(
-                        "Savepoint directory is not configured, can't stop job with savepoint.");
+                        "Savepoint directory is not configured ('execution.checkpointing.savepoint-dir'), can't stop job with savepoint.");
     }
 
     @Test
@@ -1798,6 +1801,10 @@ class MaterializedTableStatementITCase extends AbstractMaterializedTableStatemen
                                     .get(PipelineOptionsInternal.PIPELINE_FIXED_JOB_ID))
                     .isEqualTo(refreshHandler.getJobId());
             assertThat(
+                            DeployScriptITCase.TestApplicationClusterClientFactory.configuration
+                                    .get(DeploymentOptions.TARGET))
+                    .isEqualTo(applicationTarget);
+            assertThat(
                             SqlDriver.parseOptions(
                                     DeployScriptITCase.TestApplicationClusterDescriptor
                                             .applicationConfiguration
@@ -1831,6 +1838,73 @@ class MaterializedTableStatementITCase extends AbstractMaterializedTableStatemen
                                     applicationTarget,
                                     "kubernetes.cluster-id",
                                     "test"));
+        } finally {
+            DeployScriptITCase.TestApplicationClusterClientFactory.id = null;
+        }
+    }
+
+    @Test
+    void testDropMaterializedTableInApplicationMode() throws Exception {
+        DeployScriptITCase.TestApplicationClusterClientFactory.id = APPLICATION_TARGET;
+        DeployScriptITCase.TestApplicationClusterDescriptor.resetRecordedRequests();
+        try {
+            final ObjectIdentifier identifier = createApplicationModeMaterializedTable();
+            final ContinuousRefreshHandler refreshHandler =
+                    getContinuousRefreshHandler(getTable(identifier));
+
+            final OperationHandle dropHandle =
+                    executeStatement(
+                            "DROP MATERIALIZED TABLE " + identifier.asSerializableString());
+            awaitOperationTermination(service, sessionHandle, dropHandle);
+
+            assertThat(DeployScriptITCase.TestApplicationClusterDescriptor.retrievedClusterId)
+                    .isEqualTo(refreshHandler.getClusterId());
+            assertThat(DeployScriptITCase.TestApplicationClusterDescriptor.cancelledJobId)
+                    .isEqualTo(JobID.fromHexString(refreshHandler.getJobId()));
+            assertThatThrownBy(() -> getTable(identifier))
+                    .isInstanceOf(SqlGatewayException.class)
+                    .hasMessageContaining("Failed to getTable.");
+        } finally {
+            DeployScriptITCase.TestApplicationClusterClientFactory.id = null;
+        }
+    }
+
+    @Test
+    void testSuspendMaterializedTableInApplicationMode() throws Exception {
+        DeployScriptITCase.TestApplicationClusterClientFactory.id = APPLICATION_TARGET;
+        DeployScriptITCase.TestApplicationClusterDescriptor.resetRecordedRequests();
+        try {
+            final ObjectIdentifier identifier = createApplicationModeMaterializedTable();
+            final ContinuousRefreshHandler activeRefreshHandler =
+                    getContinuousRefreshHandler(getTable(identifier));
+
+            final String savepointDirectory = "file:/test-application-savepoints";
+            final Configuration suspendConfig = new Configuration();
+            suspendConfig.set(SAVEPOINT_DIRECTORY, savepointDirectory);
+            final OperationHandle suspendHandle =
+                    executeStatement(
+                            "ALTER MATERIALIZED TABLE "
+                                    + identifier.asSerializableString()
+                                    + " SUSPEND",
+                            -1,
+                            suspendConfig);
+            awaitOperationTermination(service, sessionHandle, suspendHandle);
+
+            assertThat(DeployScriptITCase.TestApplicationClusterDescriptor.retrievedClusterId)
+                    .isEqualTo(activeRefreshHandler.getClusterId());
+            assertThat(DeployScriptITCase.TestApplicationClusterDescriptor.stoppedJobId)
+                    .isEqualTo(JobID.fromHexString(activeRefreshHandler.getJobId()));
+            assertThat(DeployScriptITCase.TestApplicationClusterDescriptor.stopSavepointDirectory)
+                    .isEqualTo(savepointDirectory);
+
+            final ResolvedCatalogMaterializedTable suspendedTable = getTable(identifier);
+            assertThat(suspendedTable.getRefreshStatus()).isSameAs(RefreshStatus.SUSPENDED);
+            final ContinuousRefreshHandler suspendedRefreshHandler =
+                    getContinuousRefreshHandler(suspendedTable);
+            assertThat(suspendedRefreshHandler.getJobId())
+                    .isEqualTo(activeRefreshHandler.getJobId());
+            assertThat(suspendedRefreshHandler.getRestorePath())
+                    .hasValue(DeployScriptITCase.TestApplicationClusterDescriptor.SAVEPOINT_PATH);
         } finally {
             DeployScriptITCase.TestApplicationClusterClientFactory.id = null;
         }
@@ -2104,6 +2178,22 @@ class MaterializedTableStatementITCase extends AbstractMaterializedTableStatemen
 
     private OperationHandle executeStatement(String statement) {
         return MaterializedTableTestUtils.executeStatement(service, sessionHandle, statement);
+    }
+
+    private ObjectIdentifier createApplicationModeMaterializedTable() throws Exception {
+        final Configuration applicationModeConfig = new Configuration();
+        applicationModeConfig.set(DeploymentOptions.TARGET, APPLICATION_TARGET);
+        final OperationHandle createHandle =
+                executeStatement(
+                        "CREATE MATERIALIZED TABLE app_mode_mt\n"
+                                + " WITH ('format' = 'debezium-json')\n"
+                                + " FRESHNESS = INTERVAL '30' SECOND\n"
+                                + " AS SELECT user_id, shop_id, COUNT(*) AS cnt"
+                                + " FROM datagenSource GROUP BY user_id, shop_id",
+                        -1,
+                        applicationModeConfig);
+        awaitOperationTermination(service, sessionHandle, createHandle);
+        return getObjectIdentifier("app_mode_mt");
     }
 
     private ContinuousRefreshHandler getContinuousRefreshHandler(

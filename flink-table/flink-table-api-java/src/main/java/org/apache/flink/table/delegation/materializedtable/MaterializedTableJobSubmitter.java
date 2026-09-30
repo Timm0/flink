@@ -19,46 +19,31 @@
 package org.apache.flink.table.delegation.materializedtable;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.table.refresh.ContinuousRefreshHandler;
 
 import java.util.Optional;
 
 /**
- * Provides the caller-specific job-submission and refresh capabilities a {@link
+ * Provides the caller-specific refresh-job submission and scheduling capabilities a {@link
  * MaterializedTableExecutor} needs to run materialized table operations.
- *
- * <p>The job-control methods apply to every job submitter. Periodic refresh scheduling is an
- * optional capability exposed through {@link #getRefreshWorkflowContext()}.
  */
 @Internal
 public interface MaterializedTableJobSubmitter {
 
     /**
-     * Submits a refresh job with the given execution configuration and INSERT statement. The
-     * implementation owns how the job reaches the cluster for the given target.
+     * Submits a refresh job for the given target with the given execution configuration and INSERT
+     * statement.
      *
-     * @param executionTarget the resolved execution target the job is submitted to.
+     * @param target the validated target the job is submitted to.
      * @param executionConfig the configuration used to submit the refresh job.
      * @param insertStatement the INSERT statement executed to refresh the materialized table.
      * @return the result identifying the submitted refresh job.
      */
     RefreshJobResult submitRefreshJob(
-            String executionTarget, Configuration executionConfig, String insertStatement);
+            RefreshJobTarget target, Configuration executionConfig, String insertStatement);
 
-    /** Returns the current status of the job identified by the given refresh handler. */
-    JobStatus getJobStatus(ContinuousRefreshHandler refreshHandler);
-
-    /** Cancels the job identified by the given refresh handler. */
-    void cancelJob(ContinuousRefreshHandler refreshHandler);
-
-    /**
-     * Stops the job identified by the given refresh handler with a savepoint.
-     *
-     * @return the path of the savepoint taken while stopping the job.
-     */
-    String stopJobWithSavepoint(ContinuousRefreshHandler refreshHandler);
+    /** Whether refresh jobs can be deployed to application targets, each in its own cluster. */
+    boolean supportsApplicationTargets();
 
     /**
      * Returns the periodic-refresh scheduling capability for full-mode materialized tables, or

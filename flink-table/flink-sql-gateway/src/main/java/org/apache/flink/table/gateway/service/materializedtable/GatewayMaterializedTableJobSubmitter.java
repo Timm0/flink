@@ -20,15 +20,12 @@ package org.apache.flink.table.gateway.service.materializedtable;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.config.TableConfigOptions;
-import org.apache.flink.table.api.internal.TableEnvironmentInternal;
 import org.apache.flink.table.data.RowData;
-import org.apache.flink.table.delegation.materializedtable.MaterializedTableClusterUtils;
 import org.apache.flink.table.delegation.materializedtable.MaterializedTableJobSubmitter;
 import org.apache.flink.table.delegation.materializedtable.RefreshJobResult;
+import org.apache.flink.table.delegation.materializedtable.RefreshJobTarget;
 import org.apache.flink.table.delegation.materializedtable.RefreshWorkflowContext;
 import org.apache.flink.table.gateway.api.operation.OperationHandle;
 import org.apache.flink.table.gateway.api.results.ResultSet;
@@ -36,9 +33,6 @@ import org.apache.flink.table.gateway.api.utils.SqlGatewayException;
 import org.apache.flink.table.gateway.service.SqlGatewayServiceImpl;
 import org.apache.flink.table.gateway.service.operation.OperationExecutor;
 import org.apache.flink.table.gateway.service.result.ResultFetcher;
-import org.apache.flink.table.operations.command.DescribeJobOperation;
-import org.apache.flink.table.operations.command.StopJobOperation;
-import org.apache.flink.table.refresh.ContinuousRefreshHandler;
 import org.apache.flink.table.refresh.RefreshHandler;
 import org.apache.flink.table.workflow.WorkflowScheduler;
 
@@ -50,8 +44,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
-import static org.apache.flink.configuration.CheckpointingOptions.SAVEPOINT_DIRECTORY;
-import static org.apache.flink.configuration.DeploymentOptions.TARGET;
 import static org.apache.flink.configuration.PipelineOptionsInternal.PIPELINE_FIXED_JOB_ID;
 import static org.apache.flink.table.factories.WorkflowSchedulerFactoryUtil.WORKFLOW_SCHEDULER_PREFIX;
 
@@ -77,76 +69,24 @@ public class GatewayMaterializedTableJobSubmitter implements MaterializedTableJo
 
     @Override
     public RefreshJobResult submitRefreshJob(
-            String executionTarget, Configuration executionConfig, String insertStatement) {
-        if (executionTarget.endsWith("application")) {
-            return deployApplication(executionTarget, executionConfig, insertStatement);
+            RefreshJobTarget target, Configuration executionConfig, String insertStatement) {
+        if (target.isApplicationTarget()) {
+            return deployApplication(target, executionConfig, insertStatement);
         }
 
-        String clusterId =
-                operationExecutor
-                        .getSessionClusterId()
-                        .orElseThrow(
-                                () -> {
-                                    String errorMessage =
-                                            String.format(
-                                                    "No cluster ID found when executing materialized table refresh job. Execution target is : %s",
-                                                    executionTarget);
-                                    LOG.error(errorMessage);
-                                    return new ValidationException(errorMessage);
-                                });
+        final Configuration statementConfig = new Configuration(executionConfig);
+        target.applyTo(statementConfig);
+        final ResultFetcher resultFetcher =
+                operationExecutor.executeStatement(handle, statementConfig, insertStatement);
+        final List<RowData> results = fetchAllResults(resultFetcher);
+        final String jobId = results.get(0).getString(0).toString();
 
-        ResultFetcher resultFetcher =
-                operationExecutor.executeStatement(handle, executionConfig, insertStatement);
-        List<RowData> results = fetchAllResults(resultFetcher);
-        String jobId = results.get(0).getString(0).toString();
-
-        return new RefreshJobResult(
-                executionTarget,
-                clusterId,
-                jobId,
-                MaterializedTableClusterUtils.buildClusterInfo(executionTarget, clusterId));
+        return new RefreshJobResult(target, jobId, null);
     }
 
     @Override
-    public JobStatus getJobStatus(ContinuousRefreshHandler refreshHandler) {
-        ResultFetcher resultFetcher =
-                operationExecutor.callDescribeJobOperation(
-                        getTableEnvironment(refreshHandler),
-                        handle,
-                        new DescribeJobOperation(refreshHandler.getJobId()));
-        List<RowData> result = fetchAllResults(resultFetcher);
-        String jobStatus = result.get(0).getString(2).toString();
-        return JobStatus.valueOf(jobStatus);
-    }
-
-    @Override
-    public void cancelJob(ContinuousRefreshHandler refreshHandler) {
-        operationExecutor.callStopJobOperation(
-                getTableEnvironment(refreshHandler),
-                handle,
-                new StopJobOperation(refreshHandler.getJobId(), false, false));
-    }
-
-    @Override
-    public String stopJobWithSavepoint(ContinuousRefreshHandler refreshHandler) {
-        // check savepoint dir is configured
-        Optional<String> savepointDir =
-                operationExecutor
-                        .getSessionContext()
-                        .getSessionConf()
-                        .getOptional(SAVEPOINT_DIRECTORY);
-        if (savepointDir.isEmpty()) {
-            throw new ValidationException(
-                    "Savepoint directory is not configured, can't stop job with savepoint.");
-        }
-        String jobId = refreshHandler.getJobId();
-        ResultFetcher resultFetcher =
-                operationExecutor.callStopJobOperation(
-                        getTableEnvironment(refreshHandler),
-                        handle,
-                        new StopJobOperation(jobId, true, false));
-        List<RowData> results = fetchAllResults(resultFetcher);
-        return results.get(0).getString(0).toString();
+    public boolean supportsApplicationTargets() {
+        return true;
     }
 
     @Override
@@ -156,42 +96,28 @@ public class GatewayMaterializedTableJobSubmitter implements MaterializedTableJo
     }
 
     private RefreshJobResult deployApplication(
-            String executionTarget, Configuration executionConfig, String insertStatement) {
-        Configuration mergedConfig =
+            RefreshJobTarget target, Configuration executionConfig, String insertStatement) {
+        final Configuration mergedConfig =
                 new Configuration(operationExecutor.getSessionContext().getSessionConf());
         mergedConfig.addAll(executionConfig);
-        mergedConfig.set(TARGET, executionTarget);
-        JobID jobId = new JobID();
+        target.applyTo(mergedConfig);
+        final JobID jobId = new JobID();
         mergedConfig.set(PIPELINE_FIXED_JOB_ID, jobId.toString());
 
         try {
-            String clusterId =
+            final String clusterId =
                     SqlGatewayServiceImpl.deployApplicationCluster(
                                     mergedConfig, null, insertStatement)
                             .toString();
 
             return new RefreshJobResult(
-                    executionTarget,
-                    clusterId,
+                    new RefreshJobTarget(target.getExecutionTarget(), clusterId),
                     jobId.toString(),
-                    MaterializedTableClusterUtils.buildClusterInfo(executionTarget, clusterId));
+                    null);
         } catch (Throwable t) {
             LOG.error("Failed to deploy script {} to application cluster.", insertStatement, t);
             throw new SqlGatewayException("Failed to deploy script to cluster.", t);
         }
-    }
-
-    private TableEnvironmentInternal getTableEnvironment(ContinuousRefreshHandler refreshHandler) {
-        String target = refreshHandler.getExecutionTarget();
-        Configuration sessionConfiguration = new Configuration();
-        sessionConfiguration.set(TARGET, target);
-        MaterializedTableClusterUtils.getClusterIdKey(target)
-                .ifPresent(
-                        key -> sessionConfiguration.setString(key, refreshHandler.getClusterId()));
-
-        return operationExecutor.getTableEnvironment(
-                operationExecutor.getSessionContext().getSessionState().resourceManager,
-                sessionConfiguration);
     }
 
     private static List<RowData> fetchAllResults(ResultFetcher resultFetcher) {

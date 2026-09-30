@@ -20,59 +20,51 @@ package org.apache.flink.table.api.internal.materializedtable;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
-import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.api.dag.Pipeline;
 import org.apache.flink.api.dag.Transformation;
-import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.configuration.DeploymentOptions;
+import org.apache.flink.configuration.PipelineOptionsInternal;
+import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.configuration.StateRecoveryOptions;
 import org.apache.flink.core.execution.JobClient;
-import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.table.api.TableConfig;
 import org.apache.flink.table.api.TableException;
-import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.delegation.Executor;
 import org.apache.flink.table.delegation.ExecutorFactory;
 import org.apache.flink.table.delegation.Planner;
-import org.apache.flink.table.delegation.materializedtable.MaterializedTableClusterUtils;
 import org.apache.flink.table.delegation.materializedtable.MaterializedTableJobSubmitter;
 import org.apache.flink.table.delegation.materializedtable.RefreshJobResult;
+import org.apache.flink.table.delegation.materializedtable.RefreshJobTarget;
 import org.apache.flink.table.delegation.materializedtable.RefreshWorkflowContext;
 import org.apache.flink.table.factories.FactoryUtil;
 import org.apache.flink.table.factories.PlannerFactoryUtil;
 import org.apache.flink.table.operations.ExecutableOperation;
 import org.apache.flink.table.operations.ModifyOperation;
 import org.apache.flink.table.operations.Operation;
-import org.apache.flink.table.refresh.ContinuousRefreshHandler;
 import org.apache.flink.table.workflow.WorkflowScheduler;
 
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
 
 import static org.apache.flink.api.common.RuntimeExecutionMode.STREAMING;
 import static org.apache.flink.configuration.ExecutionOptions.RUNTIME_MODE;
+import static org.apache.flink.table.delegation.materializedtable.MaterializedTableClusterUtils.MINICLUSTER_TARGET;
 
 /**
  * The default implementation of a {@link MaterializedTableJobSubmitter}.
  *
- * <p>It does not expose a {@link WorkflowScheduler}, so full-mode materialized tables cannot be
- * created, suspended, resumed or dropped here, while a one-time REFRESH still works.
+ * <p>It does not support application targets (see {@link #supportsApplicationTargets()}) and does
+ * not expose a {@link WorkflowScheduler}, so full-mode materialized tables cannot be created,
+ * suspended, resumed or dropped here, while a one-time REFRESH still works.
  */
 @Internal
 public class DefaultMaterializedTableJobSubmitter implements MaterializedTableJobSubmitter {
-
-    private static final String EMBEDDED_TARGET = "embedded";
 
     private static final String DEFAULT_REFRESH_JOB_NAME = "materialized-table-refresh";
 
     private final ExecutableOperation.Context operationCtx;
     private final Planner planner;
     private final Executor sessionExecutor;
-
-    private final Map<String, JobClient> refreshJobClients = new HashMap<>();
 
     public DefaultMaterializedTableJobSubmitter(
             ExecutableOperation.Context operationCtx, Planner planner, Executor sessionExecutor) {
@@ -83,72 +75,19 @@ public class DefaultMaterializedTableJobSubmitter implements MaterializedTableJo
 
     @Override
     public RefreshJobResult submitRefreshJob(
-            String executionTarget, Configuration executionConfig, String insertStatement) {
-        if (executionTarget.endsWith("application") || EMBEDDED_TARGET.equals(executionTarget)) {
-            throw new TableException(
-                    "Application-mode materialized table refresh is not supported in this environment.");
-        }
-
-        String clusterId =
-                MaterializedTableClusterUtils.getClusterId(
-                        executionTarget, operationCtx.getTableConfig());
-
-        boolean isStreamingRefresh = STREAMING == executionConfig.get(RUNTIME_MODE);
-        JobClient jobClient =
+            RefreshJobTarget target, Configuration executionConfig, String insertStatement) {
+        final boolean isStreamingRefresh = STREAMING == executionConfig.get(RUNTIME_MODE);
+        final JobClient jobClient =
                 isStreamingRefresh == operationCtx.isStreamingMode()
-                        ? submitWithSessionPlanner(
-                                executionTarget, executionConfig, insertStatement)
-                        : submitWithThrowawayPlanner(
-                                executionTarget, executionConfig, insertStatement);
+                        ? submitWithSessionPlanner(target, executionConfig, insertStatement)
+                        : submitWithThrowawayPlanner(target, executionConfig, insertStatement);
 
-        String jobId = jobClient.getJobID().toString();
-        if (isStreamingRefresh) {
-            refreshJobClients.put(jobId, jobClient);
-        }
-
-        return new RefreshJobResult(
-                executionTarget,
-                clusterId,
-                jobId,
-                MaterializedTableClusterUtils.buildClusterInfo(executionTarget, clusterId));
+        return new RefreshJobResult(target, jobClient.getJobID().toString(), jobClient);
     }
 
     @Override
-    public JobStatus getJobStatus(ContinuousRefreshHandler refreshHandler) {
-        JobClient jobClient = requireLocalJobClient(refreshHandler);
-        return awaitJobClientResult(
-                jobClient.getJobStatus(),
-                String.format(
-                        "Failed to get the status of refresh job %s.", refreshHandler.getJobId()));
-    }
-
-    @Override
-    public void cancelJob(ContinuousRefreshHandler refreshHandler) {
-        JobClient jobClient = requireLocalJobClient(refreshHandler);
-        awaitJobClientResult(
-                jobClient.cancel(),
-                String.format("Failed to cancel the refresh job %s.", refreshHandler.getJobId()));
-        refreshJobClients.remove(refreshHandler.getJobId());
-    }
-
-    @Override
-    public String stopJobWithSavepoint(ContinuousRefreshHandler refreshHandler) {
-        JobClient jobClient = requireLocalJobClient(refreshHandler);
-        String savepointDir =
-                operationCtx.getTableConfig().get(CheckpointingOptions.SAVEPOINT_DIRECTORY);
-        if (savepointDir == null || savepointDir.isEmpty()) {
-            throw new ValidationException(
-                    "Savepoint directory is not configured, can't stop job with savepoint.");
-        }
-        String savepointPath =
-                awaitJobClientResult(
-                        jobClient.stopWithSavepoint(
-                                false, savepointDir, SavepointFormatType.DEFAULT),
-                        String.format(
-                                "Failed to stop the refresh job %s with a savepoint.",
-                                refreshHandler.getJobId()));
-        refreshJobClients.remove(refreshHandler.getJobId());
-        return savepointPath;
+    public boolean supportsApplicationTargets() {
+        return false;
     }
 
     @Override
@@ -156,30 +95,42 @@ public class DefaultMaterializedTableJobSubmitter implements MaterializedTableJo
         return Optional.empty();
     }
 
+    @VisibleForTesting
+    static Configuration refreshConfiguration(
+            Configuration tableConfiguration,
+            Configuration executionConfig,
+            RefreshJobTarget target) {
+        final Configuration refreshConfig = new Configuration(tableConfiguration);
+        refreshConfig.addAll(executionConfig);
+        target.applyTo(refreshConfig);
+        return refreshConfig;
+    }
+
     private JobClient submitWithSessionPlanner(
-            String executionTarget, Configuration executionConfig, String insertStatement) {
-        ModifyOperation modifyOperation = parseSingleInsertOperation(planner, insertStatement);
+            RefreshJobTarget target, Configuration executionConfig, String insertStatement) {
+        final ModifyOperation modifyOperation =
+                parseSingleInsertOperation(planner, insertStatement);
         operationCtx.getResourceManager().addJarConfiguration(operationCtx.getTableConfig());
 
-        Configuration pipelineConfig =
-                new Configuration(operationCtx.getTableConfig().getConfiguration());
-        pipelineConfig.addAll(executionConfig);
+        final Configuration pipelineConfig =
+                refreshConfiguration(
+                        operationCtx.getTableConfig().getConfiguration(), executionConfig, target);
         return submitPipeline(
-                planner, modifyOperation, createRefreshExecutor(), pipelineConfig, executionTarget);
+                planner, modifyOperation, createRefreshExecutor(target), pipelineConfig);
     }
 
     private JobClient submitWithThrowawayPlanner(
-            String executionTarget, Configuration executionConfig, String insertStatement) {
-        Configuration refreshConfig =
-                new Configuration(operationCtx.getTableConfig().getConfiguration());
-        refreshConfig.addAll(executionConfig);
-        TableConfig refreshTableConfig = TableConfig.getDefault();
+            RefreshJobTarget target, Configuration executionConfig, String insertStatement) {
+        final Configuration refreshConfig =
+                refreshConfiguration(
+                        operationCtx.getTableConfig().getConfiguration(), executionConfig, target);
+        final TableConfig refreshTableConfig = TableConfig.getDefault();
         refreshTableConfig.setRootConfiguration(
                 operationCtx.getTableConfig().getRootConfiguration());
         refreshTableConfig.addConfiguration(refreshConfig);
 
-        Executor refreshExecutor = createRefreshExecutor();
-        Planner refreshPlanner =
+        final Executor refreshExecutor = createRefreshExecutor(target);
+        final Planner refreshPlanner =
                 PlannerFactoryUtil.createPlanner(
                         refreshExecutor,
                         refreshTableConfig,
@@ -188,7 +139,7 @@ public class DefaultMaterializedTableJobSubmitter implements MaterializedTableJo
                         operationCtx.getCatalogManager(),
                         operationCtx.getFunctionCatalog());
 
-        ModifyOperation modifyOperation =
+        final ModifyOperation modifyOperation =
                 parseSingleInsertOperation(refreshPlanner, insertStatement);
         operationCtx.getResourceManager().addJarConfiguration(refreshTableConfig);
 
@@ -196,32 +147,43 @@ public class DefaultMaterializedTableJobSubmitter implements MaterializedTableJo
                 refreshPlanner,
                 modifyOperation,
                 refreshExecutor,
-                refreshTableConfig.getConfiguration(),
-                executionTarget);
+                refreshTableConfig.getConfiguration());
     }
 
-    private Executor createRefreshExecutor() {
-        ExecutorFactory executorFactory =
+    private Executor createRefreshExecutor(RefreshJobTarget target) {
+        final ExecutorFactory executorFactory =
                 FactoryUtil.discoverFactory(
                         operationCtx.getResourceManager().getUserClassLoader(),
                         ExecutorFactory.class,
                         ExecutorFactory.DEFAULT_IDENTIFIER);
+
+        if (MINICLUSTER_TARGET.equals(target.getExecutionTarget())) {
+            return executorFactory.create(
+                    refreshExecutorConfiguration(sessionExecutor.getConfiguration()));
+        }
+
         return executorFactory.create(
-                Configuration.fromMap(sessionExecutor.getConfiguration().toMap()));
+                refreshExecutorConfiguration(sessionExecutor.getConfiguration()),
+                operationCtx.getResourceManager().getUserClassLoader());
+    }
+
+    @VisibleForTesting
+    static Configuration refreshExecutorConfiguration(ReadableConfig programConfiguration) {
+        final Configuration configuration = Configuration.fromMap(programConfiguration.toMap());
+        configuration.removeConfig(PipelineOptionsInternal.PIPELINE_FIXED_JOB_ID);
+        configuration.removeConfig(StateRecoveryOptions.SAVEPOINT_PATH);
+        return configuration;
     }
 
     private static JobClient submitPipeline(
             Planner planner,
             ModifyOperation modifyOperation,
             Executor refreshExecutor,
-            Configuration pipelineConfig,
-            String executionTarget) {
-        List<Transformation<?>> transformations = planner.translate(List.of(modifyOperation));
-        Configuration jobConfig = new Configuration(pipelineConfig);
-        jobConfig.set(DeploymentOptions.TARGET, executionTarget);
-        Pipeline pipeline =
+            Configuration pipelineConfig) {
+        final List<Transformation<?>> transformations = planner.translate(List.of(modifyOperation));
+        final Pipeline pipeline =
                 refreshExecutor.createPipeline(
-                        transformations, jobConfig, DEFAULT_REFRESH_JOB_NAME);
+                        transformations, pipelineConfig, DEFAULT_REFRESH_JOB_NAME);
         try {
             return refreshExecutor.executeAsync(pipeline);
         } catch (Exception e) {
@@ -231,7 +193,7 @@ public class DefaultMaterializedTableJobSubmitter implements MaterializedTableJo
 
     private static ModifyOperation parseSingleInsertOperation(
             Planner planner, String insertStatement) {
-        List<Operation> operations = planner.getParser().parse(insertStatement);
+        final List<Operation> operations = planner.getParser().parse(insertStatement);
         if (operations.size() != 1 || !(operations.get(0) instanceof ModifyOperation)) {
             throw new TableException(
                     String.format(
@@ -240,26 +202,5 @@ public class DefaultMaterializedTableJobSubmitter implements MaterializedTableJo
                             insertStatement));
         }
         return (ModifyOperation) operations.get(0);
-    }
-
-    @VisibleForTesting
-    static <T> T awaitJobClientResult(CompletableFuture<T> request, String errorMessage) {
-        try {
-            return request.get();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new TableException(errorMessage, e);
-        } catch (Exception e) {
-            throw new TableException(errorMessage, e);
-        }
-    }
-
-    private JobClient requireLocalJobClient(ContinuousRefreshHandler refreshHandler) {
-        JobClient jobClient = refreshJobClients.get(refreshHandler.getJobId());
-        if (jobClient == null) {
-            throw new TableException(
-                    "Controlling a refresh job started by another session is not supported in this environment.");
-        }
-        return jobClient;
     }
 }

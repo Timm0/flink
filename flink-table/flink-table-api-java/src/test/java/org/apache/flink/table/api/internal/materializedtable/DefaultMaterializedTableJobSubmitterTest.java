@@ -19,15 +19,16 @@
 package org.apache.flink.table.api.internal.materializedtable;
 
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.table.api.TableException;
-import org.apache.flink.table.refresh.ContinuousRefreshHandler;
+import org.apache.flink.configuration.DeploymentOptions;
+import org.apache.flink.configuration.PipelineOptions;
+import org.apache.flink.configuration.PipelineOptionsInternal;
+import org.apache.flink.configuration.StateRecoveryOptions;
+import org.apache.flink.core.execution.RecoveryClaimMode;
+import org.apache.flink.table.delegation.materializedtable.RefreshJobTarget;
 
 import org.junit.jupiter.api.Test;
 
-import java.util.concurrent.CompletableFuture;
-
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link DefaultMaterializedTableJobSubmitter}. */
 class DefaultMaterializedTableJobSubmitterTest {
@@ -38,67 +39,68 @@ class DefaultMaterializedTableJobSubmitterTest {
     }
 
     @Test
-    void testApplicationTargetIsRejected() {
-        assertThatThrownBy(
-                        () ->
-                                newSubmitter()
-                                        .submitRefreshJob(
-                                                "kubernetes-application",
-                                                new Configuration(),
-                                                "INSERT INTO t SELECT * FROM s"))
-                .isInstanceOf(TableException.class)
-                .hasMessageContaining(
-                        "Application-mode materialized table refresh is not supported in this environment.");
+    void testApplicationTargetsAreUnsupported() {
+        assertThat(newSubmitter().supportsApplicationTargets()).isFalse();
     }
 
     @Test
-    void testEmbeddedTargetIsRejected() {
-        assertThatThrownBy(
-                        () ->
-                                newSubmitter()
-                                        .submitRefreshJob(
-                                                "embedded",
-                                                new Configuration(),
-                                                "INSERT INTO t SELECT * FROM s"))
-                .isInstanceOf(TableException.class)
-                .hasMessageContaining(
-                        "Application-mode materialized table refresh is not supported in this environment.");
+    void testTargetOverridesTheTableAndExecutionConfiguration() {
+        final Configuration tableConfiguration = new Configuration();
+        tableConfiguration.set(DeploymentOptions.TARGET, "remote");
+        tableConfiguration.setString("kubernetes.cluster-id", "from-table-config");
+        tableConfiguration.set(PipelineOptions.NAME, "from-table-config");
+        tableConfiguration.setString("rest.address", "table-config-host");
+        final Configuration executionConfig = new Configuration();
+        executionConfig.setString("kubernetes.cluster-id", "from-execution-config");
+        executionConfig.set(PipelineOptions.NAME, "refresh-job");
+
+        final Configuration refreshConfig =
+                DefaultMaterializedTableJobSubmitter.refreshConfiguration(
+                        tableConfiguration,
+                        executionConfig,
+                        new RefreshJobTarget("kubernetes-session", "resolved"));
+
+        assertThat(refreshConfig.toMap())
+                .containsEntry("execution.target", "kubernetes-session")
+                .containsEntry("kubernetes.cluster-id", "resolved")
+                .containsEntry("pipeline.name", "refresh-job")
+                .containsEntry("rest.address", "table-config-host");
+        assertThat(tableConfiguration.get(DeploymentOptions.TARGET)).isEqualTo("remote");
     }
 
     @Test
-    void testControllingAnUnknownJobIsRejected() {
-        ContinuousRefreshHandler handler =
-                new ContinuousRefreshHandler("remote", "cluster-id", "job-id");
+    void testRefreshExecutorConfigurationDropsTheProgramsFixedJobId() {
+        final Configuration programConfiguration = new Configuration();
+        programConfiguration.set(
+                PipelineOptionsInternal.PIPELINE_FIXED_JOB_ID, "00000000000000000000000000000001");
+        programConfiguration.set(PipelineOptions.NAME, "program");
 
-        String expectedMessage =
-                "Controlling a refresh job started by another session is not supported in this environment.";
+        final Configuration refreshExecutorConfiguration =
+                DefaultMaterializedTableJobSubmitter.refreshExecutorConfiguration(
+                        programConfiguration);
 
-        assertThatThrownBy(() -> newSubmitter().getJobStatus(handler))
-                .isInstanceOf(TableException.class)
-                .hasMessageContaining(expectedMessage);
-        assertThatThrownBy(() -> newSubmitter().cancelJob(handler))
-                .isInstanceOf(TableException.class)
-                .hasMessageContaining(expectedMessage);
-        assertThatThrownBy(() -> newSubmitter().stopJobWithSavepoint(handler))
-                .isInstanceOf(TableException.class)
-                .hasMessageContaining(expectedMessage);
+        assertThat(refreshExecutorConfiguration.toMap())
+                .doesNotContainKey(PipelineOptionsInternal.PIPELINE_FIXED_JOB_ID.key())
+                .containsEntry(PipelineOptions.NAME.key(), "program");
     }
 
     @Test
-    void testInterruptedWaitRestoresTheInterruptFlag() {
-        Thread.currentThread().interrupt();
-        try {
-            assertThatThrownBy(
-                            () ->
-                                    DefaultMaterializedTableJobSubmitter.awaitJobClientResult(
-                                            new CompletableFuture<>(), "Failed to cancel."))
-                    .isInstanceOf(TableException.class)
-                    .hasMessage("Failed to cancel.")
-                    .hasCauseInstanceOf(InterruptedException.class);
-            assertThat(Thread.currentThread().isInterrupted()).isTrue();
-        } finally {
-            Thread.interrupted();
-        }
+    void testRefreshExecutorConfigurationDropsTheProgramsSavepointPath() {
+        final Configuration programConfiguration = new Configuration();
+        programConfiguration.set(StateRecoveryOptions.SAVEPOINT_PATH, "file:///program-savepoint");
+        programConfiguration.set(StateRecoveryOptions.SAVEPOINT_IGNORE_UNCLAIMED_STATE, true);
+        programConfiguration.set(StateRecoveryOptions.RESTORE_MODE, RecoveryClaimMode.CLAIM);
+        programConfiguration.set(StateRecoveryOptions.LOCAL_RECOVERY, true);
+
+        final Configuration refreshExecutorConfiguration =
+                DefaultMaterializedTableJobSubmitter.refreshExecutorConfiguration(
+                        programConfiguration);
+
+        assertThat(refreshExecutorConfiguration.toMap())
+                .doesNotContainKey(StateRecoveryOptions.SAVEPOINT_PATH.key())
+                .containsEntry(StateRecoveryOptions.SAVEPOINT_IGNORE_UNCLAIMED_STATE.key(), "true")
+                .containsEntry(StateRecoveryOptions.RESTORE_MODE.key(), "CLAIM")
+                .containsEntry(StateRecoveryOptions.LOCAL_RECOVERY.key(), "true");
     }
 
     private static DefaultMaterializedTableJobSubmitter newSubmitter() {

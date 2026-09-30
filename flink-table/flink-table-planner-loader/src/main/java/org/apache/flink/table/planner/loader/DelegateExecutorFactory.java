@@ -39,6 +39,11 @@ public class DelegateExecutorFactory extends BaseDelegateFactory<StreamExecutorF
         return delegate.create(configuration);
     }
 
+    @Override
+    public Executor create(Configuration configuration, ClassLoader classLoader) {
+        return delegate.create(configuration, classLoader);
+    }
+
     public Executor create(StreamExecutionEnvironment streamExecutionEnvironment) {
         return delegate.create(streamExecutionEnvironment);
     }

@@ -18,8 +18,21 @@
 
 package org.apache.flink.table.planner.delegation.materializedtable;
 
+import org.apache.flink.api.common.JobID;
+import org.apache.flink.api.common.JobStatus;
+import org.apache.flink.configuration.CheckpointingOptions;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.DeploymentOptions;
+import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.table.api.TableException;
+import org.apache.flink.table.catalog.CatalogMaterializedTable;
+import org.apache.flink.table.catalog.CatalogMaterializedTable.RefreshStatus;
 import org.apache.flink.table.catalog.IntervalFreshness;
 import org.apache.flink.table.catalog.ObjectIdentifier;
+import org.apache.flink.table.catalog.ObjectPath;
+import org.apache.flink.table.delegation.materializedtable.MaterializedTableJobSubmitter;
+import org.apache.flink.table.planner.delegation.materializedtable.MaterializedTableTestUtils.FailingCatalog;
+import org.apache.flink.table.planner.delegation.materializedtable.MaterializedTableTestUtils.TestingJobSubmitter;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -33,11 +46,31 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.stream.Stream;
 
+import static org.apache.flink.table.planner.delegation.materializedtable.MaterializedTableTestUtils.getMaterializedTable;
+import static org.apache.flink.table.planner.delegation.materializedtable.MaterializedTableTestUtils.getRefreshHandler;
+import static org.apache.flink.table.planner.delegation.materializedtable.MaterializedTableTestUtils.hasRefreshStatus;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for the {@link DefaultMaterializedTableExecutor}. */
 class DefaultMaterializedTableExecutorTest {
+
+    private static final String CATALOG = "mt_cat";
+    private static final String DATABASE = "mt_db";
+    private static final ObjectPath MATERIALIZED_TABLE = new ObjectPath(DATABASE, "my_mt");
+    private static final String SAVEPOINT_DIRECTORY = "file:///savepoints";
+
+    private static final String CREATE_MATERIALIZED_TABLE =
+            "CREATE MATERIALIZED TABLE my_mt"
+                    + "\n FRESHNESS = INTERVAL '30' SECOND"
+                    + "\n REFRESH_MODE = CONTINUOUS"
+                    + "\n AS SELECT k, v FROM datagen_source";
+
+    private static final String ALTER_AS_QUERY =
+            "ALTER MATERIALIZED TABLE my_mt"
+                    + " AS SELECT k, v, v * 2 AS doubled_v FROM datagen_source";
+
+    private final FailingCatalog catalog = new FailingCatalog(CATALOG, DATABASE);
 
     @Test
     void testGetManuallyRefreshStatement() {
@@ -444,6 +477,94 @@ class DefaultMaterializedTableExecutorTest {
                         .tableOptions("partition.fields.hour.date-formatter", "HH")
                         .errorMessage(
                                 "Failed to parse a valid partition value for the field 'day' in materialized table `catalog`.`database`.`table` using the scheduler time '2024-01-01' based on the date format 'yyyy-MM-dd HH:mm:ss'."));
+    }
+
+    @Test
+    void resumeDoesNotRestartARefreshJobThatIsOnlyLocallySuspended() {
+        final TestingJobClient suspendedJob =
+                new TestingJobClient(new JobID(), JobStatus.SUSPENDED);
+        final TestingJobSubmitter jobSubmitter = TestingJobSubmitter.scripted(suspendedJob);
+        final TableEnvironment tableEnv = createTableEnvironment(jobSubmitter);
+        tableEnv.executeSql(CREATE_MATERIALIZED_TABLE);
+
+        assertThatThrownBy(() -> tableEnv.executeSql("ALTER MATERIALIZED TABLE my_mt RESUME"))
+                .isInstanceOf(TableException.class)
+                .hasMessageContaining(
+                        "continuous refresh job has been resumed, jobId is "
+                                + suspendedJob.getJobID());
+        assertThat(jobSubmitter.targets).hasSize(1);
+    }
+
+    @Test
+    void resumeReportsARunningRefreshJobBeforeResolvingTheRestartTarget() {
+        final TestingJobClient runningJob = new TestingJobClient(new JobID(), JobStatus.RUNNING);
+        final TestingJobSubmitter jobSubmitter = TestingJobSubmitter.scripted(runningJob);
+        final TableEnvironment tableEnv = createTableEnvironment(jobSubmitter);
+        tableEnv.executeSql(CREATE_MATERIALIZED_TABLE);
+        tableEnv.getConfig().set(DeploymentOptions.TARGET, "local");
+
+        assertThatThrownBy(() -> tableEnv.executeSql("ALTER MATERIALIZED TABLE my_mt RESUME"))
+                .isInstanceOf(TableException.class)
+                .hasMessageContaining(
+                        "continuous refresh job has been resumed, jobId is "
+                                + runningJob.getJobID());
+        assertThat(jobSubmitter.targets).hasSize(1);
+    }
+
+    @Test
+    void dropDoesNotCancelASuspendedRefreshJob() throws Exception {
+        final TestingJobClient suspendedJob =
+                new TestingJobClient(new JobID(), JobStatus.SUSPENDED);
+        final TableEnvironment tableEnv =
+                createTableEnvironment(TestingJobSubmitter.scripted(suspendedJob));
+        tableEnv.executeSql(CREATE_MATERIALIZED_TABLE);
+
+        tableEnv.executeSql("DROP MATERIALIZED TABLE my_mt");
+
+        assertThat(suspendedJob.isCancelRequested()).isFalse();
+        assertThat(catalog.tableExists(MATERIALIZED_TABLE)).isFalse();
+    }
+
+    @Test
+    void alterDoesNotRestartThePreviousDefinitionWhileTheNewRefreshJobMayStillRun()
+            throws Exception {
+        final TestingJobClient previousJob = new TestingJobClient(new JobID(), JobStatus.RUNNING);
+        final JobID newJobId = new JobID();
+        final TestingJobClient uncancellableNewJob =
+                new TestingJobClient(newJobId, JobStatus.RUNNING).withFailingCancel();
+        final TestingJobSubmitter jobSubmitter =
+                TestingJobSubmitter.scripted(previousJob, uncancellableNewJob);
+        final TableEnvironment tableEnv = createTableEnvironment(jobSubmitter);
+        tableEnv.executeSql(CREATE_MATERIALIZED_TABLE);
+        final String previousQuery =
+                getMaterializedTable(catalog, MATERIALIZED_TABLE).getExpandedQuery();
+        catalog.failNextAlterTable(hasRefreshStatus(RefreshStatus.ACTIVATED));
+
+        assertThatThrownBy(() -> tableEnv.executeSql(ALTER_AS_QUERY))
+                .isInstanceOf(TableException.class)
+                .hasMessageContaining("the new refresh job could not be cancelled")
+                .hasMessageContaining("must be cancelled manually")
+                .hasStackTraceContaining(newJobId.toHexString());
+
+        final CatalogMaterializedTable materializedTable =
+                getMaterializedTable(catalog, MATERIALIZED_TABLE);
+        assertThat(materializedTable.getRefreshStatus()).isEqualTo(RefreshStatus.SUSPENDED);
+        assertThat(materializedTable.getExpandedQuery()).isEqualTo(previousQuery);
+        assertThat(getRefreshHandler(catalog, MATERIALIZED_TABLE).getRestorePath())
+                .contains(SAVEPOINT_DIRECTORY + "/savepoint-1");
+        assertThat(jobSubmitter.targets).hasSize(2);
+    }
+
+    private TableEnvironment createTableEnvironment(MaterializedTableJobSubmitter jobSubmitter) {
+        final Configuration rootConfiguration = new Configuration();
+        rootConfiguration.set(DeploymentOptions.TARGET, "remote");
+        rootConfiguration.set(CheckpointingOptions.SAVEPOINT_DIRECTORY, SAVEPOINT_DIRECTORY);
+        final TableEnvironment tableEnv =
+                MaterializedTableTestUtils.createTableEnvironment(
+                        rootConfiguration, CATALOG, catalog, jobSubmitter);
+        tableEnv.executeSql(
+                "CREATE TABLE datagen_source (k INT, v BIGINT) WITH ('connector' = 'datagen')");
+        return tableEnv;
     }
 
     private static class TestSpec {

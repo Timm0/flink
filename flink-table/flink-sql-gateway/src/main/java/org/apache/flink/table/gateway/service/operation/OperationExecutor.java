@@ -205,11 +205,7 @@ public class OperationExecutor {
     }
 
     public ResultFetcher configureSession(OperationHandle handle, String statement) {
-        TableEnvironmentInternal tableEnv =
-                getTableEnvironment(
-                        sessionContext.getSessionState().resourceManager,
-                        new Configuration(),
-                        handle);
+        TableEnvironmentInternal tableEnv = getTableEnvironment(handle);
         List<Operation> parsedOperations = tableEnv.getParser().parse(statement);
         if (parsedOperations.size() > 1) {
             throw new UnsupportedOperationException(
@@ -407,13 +403,12 @@ public class OperationExecutor {
     // --------------------------------------------------------------------------------------------
 
     public TableEnvironmentInternal getTableEnvironment() {
-        return getTableEnvironment(
-                sessionContext.getSessionState().resourceManager, new Configuration());
+        return getTableEnvironment((OperationHandle) null);
     }
 
-    public TableEnvironmentInternal getTableEnvironment(
-            ResourceManager resourceManager, Configuration customConfig) {
-        return getTableEnvironment(resourceManager, customConfig, null);
+    private TableEnvironmentInternal getTableEnvironment(@Nullable OperationHandle handle) {
+        return getTableEnvironment(
+                sessionContext.getSessionState().resourceManager, new Configuration(), handle);
     }
 
     public TableEnvironmentInternal getTableEnvironment(
@@ -455,14 +450,6 @@ public class OperationExecutor {
                 resourceManager,
                 sessionContext.getSessionState().functionCatalog.copy(resourceManager),
                 customMaterializedTableJobSubmitter);
-    }
-
-    public <ClusterID> Optional<String> getSessionClusterId() {
-        ClusterClientFactory<ClusterID> clusterClientFactory =
-                clusterClientServiceLoader.getClusterClientFactory(sessionContext.getSessionConf());
-        ClusterID clusterID = clusterClientFactory.getClusterId(sessionContext.getSessionConf());
-
-        return Optional.ofNullable(clusterID).map(ClusterID::toString);
     }
 
     private static Executor lookupExecutor(
@@ -608,11 +595,7 @@ public class OperationExecutor {
             @Nullable String scheduleTime,
             Map<String, String> staticPartitions,
             Map<String, String> dynamicOptions) {
-        TableEnvironmentInternal tEnv =
-                getTableEnvironment(
-                        sessionContext.getSessionState().resourceManager,
-                        new Configuration(),
-                        handle);
+        TableEnvironmentInternal tEnv = getTableEnvironment(handle);
         UnresolvedIdentifier unresolvedIdentifier =
                 tEnv.getParser().parseIdentifier(materializedTableIdentifier);
         ObjectIdentifier objectIdentifier =
@@ -803,7 +786,7 @@ public class OperationExecutor {
                 .collect(Collectors.toUnmodifiableSet());
     }
 
-    public ResultFetcher callStopJobOperation(
+    private ResultFetcher callStopJobOperation(
             TableEnvironmentInternal tableEnv,
             OperationHandle handle,
             StopJobOperation stopJobOperation)
@@ -902,7 +885,7 @@ public class OperationExecutor {
                 resultRows);
     }
 
-    public ResultFetcher callDescribeJobOperation(
+    private ResultFetcher callDescribeJobOperation(
             TableEnvironmentInternal tableEnv,
             OperationHandle operationHandle,
             DescribeJobOperation describeJobOperation)

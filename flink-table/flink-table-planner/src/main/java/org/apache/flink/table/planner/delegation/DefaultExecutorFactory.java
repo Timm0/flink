@@ -49,6 +49,11 @@ public final class DefaultExecutorFactory implements StreamExecutorFactory {
     }
 
     @Override
+    public Executor create(Configuration configuration, ClassLoader classLoader) {
+        return create(new StreamExecutionEnvironment(configuration, classLoader));
+    }
+
+    @Override
     public Executor create(StreamExecutionEnvironment executionEnvironment) {
         return new DefaultExecutor(executionEnvironment);
     }

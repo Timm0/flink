@@ -172,6 +172,8 @@ public class DeployScriptITCase {
     public static class TestApplicationClusterClientFactory<ClusterID>
             implements ClusterClientFactory {
 
+        private static final String CLUSTER_ID_KEY = "kubernetes.cluster-id";
+
         public static String id;
 
         public static volatile Configuration configuration;
@@ -191,7 +193,7 @@ public class DeployScriptITCase {
         @Override
         @Nullable
         public String getClusterId(Configuration configuration) {
-            return "test-application";
+            return configuration.getString(CLUSTER_ID_KEY, null);
         }
 
         @Override
@@ -204,13 +206,31 @@ public class DeployScriptITCase {
     /** Test {@link ClusterDescriptor} capturing the deployed {@link ApplicationConfiguration}. */
     public static class TestApplicationClusterDescriptor<T> implements ClusterDescriptor<T> {
 
+        /** The savepoint path every stop-with-savepoint request completes with. */
+        public static final String SAVEPOINT_PATH = "file:/test-application-savepoint";
+
         @SuppressWarnings("rawTypes")
         private static final TestApplicationClusterDescriptor INSTANCE =
                 new TestApplicationClusterDescriptor<>();
 
         public static volatile ApplicationConfiguration applicationConfiguration;
 
+        public static volatile Object retrievedClusterId;
+
+        public static volatile JobID cancelledJobId;
+
+        public static volatile JobID stoppedJobId;
+
+        public static volatile String stopSavepointDirectory;
+
         private TestApplicationClusterDescriptor() {}
+
+        public static void resetRecordedRequests() {
+            retrievedClusterId = null;
+            cancelledJobId = null;
+            stoppedJobId = null;
+            stopSavepointDirectory = null;
+        }
 
         @Override
         public String getClusterDescription() {
@@ -219,7 +239,13 @@ public class DeployScriptITCase {
 
         @Override
         public ClusterClientProvider<T> retrieve(T clusterId) {
-            throw new UnsupportedOperationException();
+            TestApplicationClusterDescriptor.retrievedClusterId = clusterId;
+            return new ClusterClientProvider<T>() {
+                @Override
+                public ClusterClient<T> getClusterClient() {
+                    return new TestClusterClient();
+                }
+            };
         }
 
         @Override
@@ -295,7 +321,7 @@ public class DeployScriptITCase {
 
         @Override
         public CompletableFuture<JobStatus> getJobStatus(JobID jobId) {
-            throw new UnsupportedOperationException();
+            return CompletableFuture.completedFuture(JobStatus.RUNNING);
         }
 
         @Override
@@ -311,7 +337,8 @@ public class DeployScriptITCase {
 
         @Override
         public CompletableFuture<Acknowledge> cancel(JobID jobId) {
-            throw new UnsupportedOperationException();
+            TestApplicationClusterDescriptor.cancelledJobId = jobId;
+            return CompletableFuture.completedFuture(Acknowledge.get());
         }
 
         @Override
@@ -326,7 +353,10 @@ public class DeployScriptITCase {
                 boolean advanceToEndOfEventTime,
                 @Nullable String savepointDirectory,
                 SavepointFormatType formatType) {
-            throw new UnsupportedOperationException();
+            TestApplicationClusterDescriptor.stoppedJobId = jobId;
+            TestApplicationClusterDescriptor.stopSavepointDirectory = savepointDirectory;
+            return CompletableFuture.completedFuture(
+                    TestApplicationClusterDescriptor.SAVEPOINT_PATH);
         }
 
         @Override

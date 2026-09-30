@@ -81,7 +81,7 @@ public abstract class AbstractMaterializedTableStatementITCase {
 
     @RegisterExtension
     @Order(1)
-    static final MiniClusterExtension MINI_CLUSTER =
+    protected static final MiniClusterExtension MINI_CLUSTER =
             new MiniClusterExtension(
                     new MiniClusterResourceConfiguration.Builder()
                             .setNumberTaskManagers(2)
@@ -111,7 +111,7 @@ public abstract class AbstractMaterializedTableStatementITCase {
     private static SessionEnvironment defaultSessionEnvironment;
     private static Path baseCatalogPath;
 
-    private String fileSystemCatalogPath;
+    protected String fileSystemCatalogPath;
     protected String fileSystemCatalogName;
 
     protected SessionHandle sessionHandle;

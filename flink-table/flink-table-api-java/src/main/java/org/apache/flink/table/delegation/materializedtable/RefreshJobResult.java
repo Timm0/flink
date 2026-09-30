@@ -19,40 +19,45 @@
 package org.apache.flink.table.delegation.materializedtable;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.core.execution.JobClient;
+
+import javax.annotation.Nullable;
 
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+
+import static org.apache.flink.util.Preconditions.checkArgument;
+import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
  * The result of submitting a materialized table refresh job, describing where the job was deployed
- * and how to identify it.
+ * and how to identify it. It optionally carries the client returned at submission.
  */
 @Internal
 public final class RefreshJobResult {
 
-    private final String executionTarget;
-    private final String clusterId;
+    private final RefreshJobTarget target;
     private final String jobId;
+    @Nullable private final JobClient jobClient;
 
-    private final Map<String, String> clusterInfo;
-
-    public RefreshJobResult(
-            String executionTarget,
-            String clusterId,
-            String jobId,
-            Map<String, String> clusterInfo) {
-        this.executionTarget = executionTarget;
-        this.clusterId = clusterId;
-        this.jobId = jobId;
-        this.clusterInfo = Map.copyOf(clusterInfo);
+    public RefreshJobResult(RefreshJobTarget target, String jobId, @Nullable JobClient jobClient) {
+        this.target = checkNotNull(target);
+        this.jobId = checkNotNull(jobId);
+        this.jobClient = jobClient;
+        checkArgument(
+                jobClient == null || jobClient.getJobID().toHexString().equals(jobId),
+                "The job client controls job %s, not refresh job %s.",
+                jobClient == null ? null : jobClient.getJobID(),
+                jobId);
     }
 
     public String getExecutionTarget() {
-        return executionTarget;
+        return target.getExecutionTarget();
     }
 
     public String getClusterId() {
-        return clusterId;
+        return target.getClusterId();
     }
 
     public String getJobId() {
@@ -60,7 +65,12 @@ public final class RefreshJobResult {
     }
 
     public Map<String, String> getClusterInfo() {
-        return clusterInfo;
+        return MaterializedTableClusterUtils.buildClusterInfo(
+                target.getExecutionTarget(), target.getClusterId());
+    }
+
+    public Optional<JobClient> getJobClient() {
+        return Optional.ofNullable(jobClient);
     }
 
     @Override
@@ -72,31 +82,16 @@ public final class RefreshJobResult {
             return false;
         }
         RefreshJobResult that = (RefreshJobResult) o;
-        return Objects.equals(executionTarget, that.executionTarget)
-                && Objects.equals(clusterId, that.clusterId)
-                && Objects.equals(jobId, that.jobId)
-                && Objects.equals(clusterInfo, that.clusterInfo);
+        return target.equals(that.target) && jobId.equals(that.jobId);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(executionTarget, clusterId, jobId, clusterInfo);
+        return Objects.hash(target, jobId);
     }
 
     @Override
     public String toString() {
-        return "RefreshJobResult{"
-                + "executionTarget='"
-                + executionTarget
-                + '\''
-                + ", clusterId='"
-                + clusterId
-                + '\''
-                + ", jobId='"
-                + jobId
-                + '\''
-                + ", clusterInfo="
-                + clusterInfo
-                + '}';
+        return "RefreshJobResult{target=" + target + ", jobId='" + jobId + "'}";
     }
 }

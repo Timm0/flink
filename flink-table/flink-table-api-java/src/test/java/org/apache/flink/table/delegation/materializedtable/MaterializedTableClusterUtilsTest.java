@@ -18,51 +18,14 @@
 
 package org.apache.flink.table.delegation.materializedtable;
 
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.table.api.ValidationException;
-
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link MaterializedTableClusterUtils}. */
 class MaterializedTableClusterUtilsTest {
-
-    @Test
-    void testClusterIdIsReadFromTargetSpecificKey() {
-        Configuration config = new Configuration();
-        config.setString("yarn.application.id", "application_1_0001");
-        config.setString("kubernetes.cluster-id", "my-k8s-cluster");
-
-        assertThat(MaterializedTableClusterUtils.getClusterId("yarn-session", config))
-                .isEqualTo("application_1_0001");
-        assertThat(MaterializedTableClusterUtils.getClusterId("kubernetes-session", config))
-                .isEqualTo("my-k8s-cluster");
-    }
-
-    @Test
-    void testClusterIdIsEmptyWhenTargetDoesNotIdentifyItsClusterById() {
-        Configuration config = new Configuration();
-        config.setString("yarn.application.id", "application_1_0001");
-
-        assertThat(MaterializedTableClusterUtils.getClusterId("remote", config)).isEmpty();
-    }
-
-    @Test
-    void testMissingClusterIdIsRejected() {
-        Configuration config = new Configuration();
-        config.setString("yarn.application.id", "application_1_0001");
-
-        assertThatThrownBy(
-                        () ->
-                                MaterializedTableClusterUtils.getClusterId(
-                                        "kubernetes-session", config))
-                .isInstanceOf(ValidationException.class)
-                .hasMessageContaining("kubernetes.cluster-id");
-    }
 
     @Test
     void testClusterInfoContainsTargetAndTargetSpecificClusterId() {

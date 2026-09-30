@@ -20,6 +20,7 @@ package org.apache.flink.table.planner.loader;
 
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ConfigurationUtils;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.delegation.ExecutorFactory;
 import org.apache.flink.table.delegation.PlannerFactory;
 import org.apache.flink.table.factories.FactoryUtil;
@@ -35,6 +36,7 @@ import java.nio.file.Paths;
 
 import static org.apache.flink.table.planner.loader.PlannerModule.FLINK_TABLE_PLANNER_FAT_JAR;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests for the services loaded through {@link PlannerModule}.
@@ -67,6 +69,26 @@ public class LoaderITCase extends TestLogger {
     }
 
     @Test
+    public void testExecutorForExecutionTargetBypassesTheContextEnvironment() {
+        final ExecutorFactory executorFactory =
+                FactoryUtil.discoverFactory(
+                        LoaderITCase.class.getClassLoader(),
+                        ExecutorFactory.class,
+                        ExecutorFactory.DEFAULT_IDENTIFIER);
+        final Configuration configuration = new Configuration();
+
+        ProgramContextEnvironment.setAsContext();
+        try {
+            assertThatThrownBy(() -> executorFactory.create(configuration))
+                    .hasMessage(ProgramContextEnvironment.CONTEXT_ENVIRONMENT_USED);
+            assertThat(executorFactory.create(configuration, LoaderITCase.class.getClassLoader()))
+                    .isNotNull();
+        } finally {
+            ProgramContextEnvironment.unsetAsContext();
+        }
+    }
+
+    @Test
     public void testPlannerFactory() {
         assertThat(
                         DelegatePlannerFactory.class
@@ -91,5 +113,24 @@ public class LoaderITCase extends TestLogger {
                 Paths.get(ConfigurationUtils.parseTempDirectories(new Configuration())[0]);
         Files.createDirectories(FileUtils.getTargetPathIfContainsSymbolicPath(tmpDirectory));
         assertThat(tmpDirectory.startsWith("flink-table-planner_")).isEqualTo(false);
+    }
+
+    private static final class ProgramContextEnvironment extends StreamExecutionEnvironment {
+
+        private static final String CONTEXT_ENVIRONMENT_USED =
+                "The program's context environment was used.";
+
+        private ProgramContextEnvironment() {}
+
+        static void setAsContext() {
+            initializeContextEnvironment(
+                    configuration -> {
+                        throw new IllegalStateException(CONTEXT_ENVIRONMENT_USED);
+                    });
+        }
+
+        static void unsetAsContext() {
+            resetContextEnvironment();
+        }
     }
 }

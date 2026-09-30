@@ -41,4 +41,20 @@ public interface ExecutorFactory extends Factory {
 
     /** Creates a corresponding {@link Executor}. */
     Executor create(Configuration configuration);
+
+    /**
+     * Creates an {@link Executor} whose jobs are submitted by the pipeline executor for the
+     * configuration's {@code execution.target}.
+     *
+     * @throws UnsupportedOperationException if this factory cannot build such an executor
+     */
+    default Executor create(Configuration configuration, ClassLoader classLoader) {
+        throw new UnsupportedOperationException(
+                String.format(
+                        "%s cannot create an executor for the configured 'execution.target', which"
+                                + " materialized table refresh jobs require to be submitted outside"
+                                + " the calling program's context environment. Implement"
+                                + " create(Configuration, ClassLoader) to support them.",
+                        getClass().getName()));
+    }
 }

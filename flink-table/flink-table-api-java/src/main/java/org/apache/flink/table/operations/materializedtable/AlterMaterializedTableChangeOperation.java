@@ -19,7 +19,6 @@
 package org.apache.flink.table.operations.materializedtable;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.internal.TableResultImpl;
 import org.apache.flink.table.api.internal.TableResultInternal;
@@ -117,7 +116,6 @@ public class AlterMaterializedTableChangeOperation extends AlterMaterializedTabl
         this.newTable = null;
     }
 
-    @VisibleForTesting
     public void validateChanges() {
         final List<TableChange> changes = getTableChanges();
         // CoA and ALTER ... AS carry the defining query, so the append-only column rules apply even
