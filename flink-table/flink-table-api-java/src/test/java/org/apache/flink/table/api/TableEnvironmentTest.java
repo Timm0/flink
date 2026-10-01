@@ -18,12 +18,16 @@
 
 package org.apache.flink.table.api;
 
+import org.apache.flink.table.catalog.Catalog;
 import org.apache.flink.table.catalog.CatalogBaseTable;
+import org.apache.flink.table.catalog.CatalogDatabaseImpl;
+import org.apache.flink.table.catalog.CatalogMaterializedTable;
 import org.apache.flink.table.catalog.CatalogModel;
 import org.apache.flink.table.catalog.CatalogTable;
 import org.apache.flink.table.catalog.CatalogView;
 import org.apache.flink.table.catalog.ContextResolvedModel;
 import org.apache.flink.table.catalog.ContextResolvedTable;
+import org.apache.flink.table.catalog.IntervalFreshness;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.catalog.ObjectPath;
 import org.apache.flink.table.catalog.exceptions.ModelNotExistException;
@@ -258,6 +262,60 @@ class TableEnvironmentTest {
         assertThat(tEnv.listModels()).containsExactly("M1", "M2");
     }
 
+    @Test
+    void testListMaterializedTablesInGivenNamespace() throws Exception {
+        final String catalogName = tEnv.getCurrentCatalog();
+        final String currentDatabase = tEnv.getCurrentDatabase();
+        final String otherDatabase = "other_database";
+        final Catalog catalog = tEnv.getCatalog(catalogName).orElseThrow(AssertionError::new);
+        catalog.createDatabase(otherDatabase, new CatalogDatabaseImpl(Map.of(), null), false);
+
+        catalog.createTable(
+                new ObjectPath(otherDatabase, "mt_b"), createMaterializedTable(), false);
+        catalog.createTable(
+                new ObjectPath(otherDatabase, "mt_a"), createMaterializedTable(), false);
+        catalog.createTable(
+                new ObjectPath(currentDatabase, "mt_current"), createMaterializedTable(), false);
+
+        tEnv.useDatabase(otherDatabase);
+        tEnv.createTable("T", TEST_DESCRIPTOR);
+        tEnv.createView("V", tEnv.from("T"));
+        tEnv.createTemporaryTable("TMP", TEST_DESCRIPTOR);
+        tEnv.useDatabase(currentDatabase);
+
+        assertThat(tEnv.listMaterializedTables(catalogName, otherDatabase))
+                .containsExactly("mt_a", "mt_b");
+        assertThat(tEnv.listMaterializedTables()).containsExactly("mt_current");
+    }
+
+    @Test
+    void testListMaterializedTablesInNamespaceWithoutMaterializedTables() {
+        tEnv.createTable("T", TEST_DESCRIPTOR);
+
+        assertThat(tEnv.listMaterializedTables(tEnv.getCurrentCatalog(), tEnv.getCurrentDatabase()))
+                .isEmpty();
+    }
+
+    @Test
+    void testListMaterializedTablesInUnknownCatalog() {
+        assertThatThrownBy(
+                        () ->
+                                tEnv.listMaterializedTables(
+                                        "unknown_catalog", tEnv.getCurrentDatabase()))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage("Catalog unknown_catalog does not exist");
+    }
+
+    @Test
+    void testListMaterializedTablesInUnknownDatabase() {
+        assertThatThrownBy(
+                        () ->
+                                tEnv.listMaterializedTables(
+                                        tEnv.getCurrentCatalog(), "unknown_database"))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage("Database unknown_database does not exist");
+    }
+
     private static void assertCreateTableFromDescriptor(
             TableEnvironmentMock tEnv, Schema schema, boolean ignoreIfExists)
             throws org.apache.flink.table.catalog.exceptions.TableNotExistException {
@@ -351,5 +409,18 @@ class TableEnvironmentTest {
             assertThat(catalogModel.getOptions()).contains(entry);
             assertThat(catalogModel.getOptions()).containsEntry(entry.getKey(), entry.getValue());
         }
+    }
+
+    private static CatalogMaterializedTable createMaterializedTable() {
+        return CatalogMaterializedTable.newBuilder()
+                .schema(TEST_SCHEMA)
+                .options(Map.of())
+                .originalQuery("SELECT 1 AS f0")
+                .expandedQuery("SELECT 1 AS f0")
+                .freshness(IntervalFreshness.ofSecond(30))
+                .logicalRefreshMode(CatalogMaterializedTable.LogicalRefreshMode.AUTOMATIC)
+                .refreshMode(CatalogMaterializedTable.RefreshMode.CONTINUOUS)
+                .refreshStatus(CatalogMaterializedTable.RefreshStatus.INITIALIZING)
+                .build();
     }
 }
