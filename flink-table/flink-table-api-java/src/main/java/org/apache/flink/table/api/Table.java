@@ -33,6 +33,8 @@ import org.apache.flink.table.legacy.api.TableSchema;
 import org.apache.flink.table.operations.QueryOperation;
 import org.apache.flink.table.types.DataType;
 
+import java.time.Duration;
+
 /**
  * The {@link Table} object is the core abstraction of the Table API. Similar to how the DataStream
  * API has {@code DataStream}s, the Table API is built around {@link Table}s.
@@ -1305,6 +1307,69 @@ public interface Table extends Explainable<Table>, Executable {
             boolean overwrite) {
         return insertInto(descriptor, conflictStrategy, overwrite).execute();
     }
+
+    /**
+     * Declares this table's query as the definition of a materialized table at the given path, with
+     * the default freshness and {@link RefreshStrategy#automatic()}.
+     *
+     * <p>Shorthand for {@code materializeInto(path,
+     * MaterializedTableDescriptor.newBuilder().build())}.
+     *
+     * <p>The path is resolved against the current catalog and database when this method is called.
+     * See {@link TableEnvironment#useDatabase(String)} and {@link
+     * TableEnvironment#useCatalog(String)} for the rules on path resolution.
+     *
+     * @param path The path of the materialized table.
+     * @return The declaration.
+     * @throws SqlParserException if the path is not a valid identifier
+     * @throws ValidationException if the query cannot be stored as SQL, see {@link
+     *     #materializeInto(String, MaterializedTableDescriptor)}
+     */
+    MaterializedPipeline materializeInto(String path);
+
+    /**
+     * Like {@link #materializeInto(String)}, with the given freshness.
+     *
+     * <p>Shorthand for {@code materializeInto(path,
+     * MaterializedTableDescriptor.newBuilder().freshness(freshness).build())}.
+     *
+     * <p>The refresh strategy is {@link RefreshStrategy#automatic()}: when the materialized table
+     * is created or converted, a freshness at or above {@code
+     * materialized-table.refresh-mode.freshness-threshold} resolves to FULL, which requires a
+     * workflow scheduler and fails on a plain {@link TableEnvironment}. Altering an existing
+     * materialized table ignores the freshness, see {@link MaterializedPipeline#execute()}. Declare
+     * {@link MaterializedTableDescriptor.Builder#continuousRefresh()} to force continuous refresh.
+     *
+     * @param path The path of the materialized table.
+     * @param freshness The freshness, a positive whole number of seconds.
+     * @return The declaration.
+     * @throws SqlParserException if the path is not a valid identifier
+     * @throws ValidationException if the freshness is not positive, has a sub-second part, or
+     *     exceeds {@link Integer#MAX_VALUE} seconds
+     * @throws ValidationException if the query cannot be stored as SQL, see {@link
+     *     #materializeInto(String, MaterializedTableDescriptor)}
+     */
+    MaterializedPipeline materializeInto(String path, Duration freshness);
+
+    /**
+     * Declares this table's query as the definition of a materialized table at the given path,
+     * described by the given descriptor.
+     *
+     * <p>The query is stored as SQL text, so it must be expressible in SQL. Functions used inline
+     * instead of registered in a catalog, tables created from a {@link TableDescriptor} and tables
+     * backed by a DataStream are rejected when this method is called, with a {@link
+     * ValidationException}.
+     *
+     * <p>The path is resolved when this method is called, as described for {@link
+     * #materializeInto(String)}.
+     *
+     * @param path The path of the materialized table.
+     * @param descriptor The declaration of the materialized table besides its query.
+     * @return The declaration.
+     * @throws SqlParserException if the path is not a valid identifier
+     * @throws ValidationException if the query cannot be stored as SQL
+     */
+    MaterializedPipeline materializeInto(String path, MaterializedTableDescriptor descriptor);
 
     /**
      * Partitions the table by a set of partition keys.
