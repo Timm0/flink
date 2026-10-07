@@ -116,6 +116,49 @@ class SqlNodeToOperationConvertTableToMaterializedTableTest
         void viewIsRejected() throws TableAlreadyExistException, DatabaseNotExistException {
             // A view is rejected regardless of the conversion flag: only tables convert.
             configureConversionEnabled(true);
+            createView("src_view");
+
+            assertThatThrownBy(
+                            () ->
+                                    parse(
+                                            "CREATE OR ALTER MATERIALIZED TABLE src_view"
+                                                    + " AS SELECT a, b FROM t1"))
+                    .isInstanceOf(ValidationException.class)
+                    .hasMessageContaining(
+                            "VIEW does not support the CREATE OR ALTER MATERIALIZED TABLE operation.");
+        }
+
+        @Test
+        void viewIsRejectedBeforeTheQueryIsValidated()
+                throws TableAlreadyExistException, DatabaseNotExistException {
+            createView("src_view");
+
+            assertThatThrownBy(
+                            () ->
+                                    parse(
+                                            "CREATE OR ALTER MATERIALIZED TABLE src_view"
+                                                    + " AS SELECT no_such_col FROM t1"))
+                    .isInstanceOf(ValidationException.class)
+                    .hasMessage(
+                            "Catalog object builtin.default.src_view of kind VIEW does not support the CREATE OR ALTER MATERIALIZED TABLE operation.");
+        }
+
+        @Test
+        void regularTableWithConversionDisabledIsRejectedBeforeTheQueryIsValidated() {
+            configureConversionEnabled(false);
+
+            assertThatThrownBy(
+                            () ->
+                                    parse(
+                                            "CREATE OR ALTER MATERIALIZED TABLE "
+                                                    + SOURCE_REGULAR_TABLE_NAME
+                                                    + " AS SELECT no_such_col FROM t1"))
+                    .isInstanceOf(ValidationException.class)
+                    .hasMessage("Regular table does not support create or alter operation.");
+        }
+
+        private void createView(String name)
+                throws TableAlreadyExistException, DatabaseNotExistException {
             final CatalogView view =
                     CatalogView.of(
                             Schema.newBuilder()
@@ -127,16 +170,7 @@ class SqlNodeToOperationConvertTableToMaterializedTableTest
                             "SELECT a, b FROM t1",
                             Map.of());
             catalog.createTable(
-                    new ObjectPath(catalogManager.getCurrentDatabase(), "src_view"), view, false);
-
-            assertThatThrownBy(
-                            () ->
-                                    parse(
-                                            "CREATE OR ALTER MATERIALIZED TABLE src_view"
-                                                    + " AS SELECT a, b FROM t1"))
-                    .isInstanceOf(ValidationException.class)
-                    .hasMessageContaining(
-                            "VIEW does not support the CREATE OR ALTER MATERIALIZED TABLE operation.");
+                    new ObjectPath(catalogManager.getCurrentDatabase(), name), view, false);
         }
 
         private void createExistingMaterializedTable()
