@@ -19,6 +19,7 @@
 package org.apache.flink.table.planner.delegation.materializedtable;
 
 import org.apache.flink.api.common.JobID;
+import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -34,14 +35,21 @@ import org.apache.flink.table.catalog.CatalogMaterializedTable.RefreshStatus;
 import org.apache.flink.table.catalog.FunctionCatalog;
 import org.apache.flink.table.catalog.GenericInMemoryCatalog;
 import org.apache.flink.table.catalog.ObjectPath;
+import org.apache.flink.table.catalog.ResolvedCatalogTable;
 import org.apache.flink.table.catalog.exceptions.CatalogException;
 import org.apache.flink.table.catalog.exceptions.TableNotExistException;
+import org.apache.flink.table.connector.sink.DynamicTableSink;
+import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.delegation.Executor;
 import org.apache.flink.table.delegation.Planner;
 import org.apache.flink.table.delegation.materializedtable.MaterializedTableJobSubmitter;
 import org.apache.flink.table.delegation.materializedtable.RefreshJobResult;
 import org.apache.flink.table.delegation.materializedtable.RefreshJobTarget;
 import org.apache.flink.table.delegation.materializedtable.RefreshWorkflowContext;
+import org.apache.flink.table.factories.DynamicTableSinkFactory;
+import org.apache.flink.table.factories.DynamicTableSourceFactory;
+import org.apache.flink.table.factories.Factory;
+import org.apache.flink.table.factories.FactoryUtil;
 import org.apache.flink.table.factories.PlannerFactoryUtil;
 import org.apache.flink.table.module.ModuleManager;
 import org.apache.flink.table.refresh.ContinuousRefreshHandler;
@@ -55,9 +63,13 @@ import java.net.URL;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Predicate;
 
 /** Test support for materialized tables: table environments, catalog access and a job submitter. */
@@ -195,6 +207,68 @@ public final class MaterializedTableTestUtils {
                 throw new CatalogException("injected drop failure");
             }
             super.dropTable(tablePath, ignoreIfNotExists);
+        }
+
+        @Override
+        public Optional<Factory> getFactory() {
+            return Optional.of(new CatalogStorageTableFactory());
+        }
+    }
+
+    /**
+     * Plays the storage of a catalog that owns its materialized tables: a table without a
+     * 'connector' option is stored in the 'values' connector.
+     */
+    public static final class CatalogStorageTableFactory
+            implements DynamicTableSourceFactory, DynamicTableSinkFactory {
+
+        @Override
+        public String factoryIdentifier() {
+            return "mt-catalog-storage";
+        }
+
+        @Override
+        public Set<ConfigOption<?>> requiredOptions() {
+            return Collections.emptySet();
+        }
+
+        @Override
+        public Set<ConfigOption<?>> optionalOptions() {
+            return Collections.emptySet();
+        }
+
+        @Override
+        public DynamicTableSource createDynamicTableSource(Context context) {
+            return FactoryUtil.createDynamicTableSource(
+                    null,
+                    context.getObjectIdentifier(),
+                    withStorageConnector(context.getCatalogTable()),
+                    Collections.emptyMap(),
+                    context.getConfiguration(),
+                    context.getClassLoader(),
+                    context.isTemporary());
+        }
+
+        @Override
+        public DynamicTableSink createDynamicTableSink(Context context) {
+            return FactoryUtil.createDynamicTableSink(
+                    null,
+                    context.getObjectIdentifier(),
+                    withStorageConnector(context.getCatalogTable()),
+                    Collections.emptyMap(),
+                    context.getConfiguration(),
+                    context.getClassLoader(),
+                    context.isTemporary());
+        }
+
+        private static ResolvedCatalogTable withStorageConnector(ResolvedCatalogTable table) {
+            if (table.getOptions().containsKey(FactoryUtil.CONNECTOR.key())) {
+                return table;
+            }
+            final Map<String, String> options = new HashMap<>(table.getOptions());
+            options.put(FactoryUtil.CONNECTOR.key(), "values");
+            options.put("sink-insert-only", "false");
+            return table.copy(options);
         }
     }
 

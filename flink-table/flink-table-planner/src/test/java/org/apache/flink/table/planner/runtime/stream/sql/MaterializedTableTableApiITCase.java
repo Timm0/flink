@@ -43,7 +43,12 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.graph.StreamGraph;
 import org.apache.flink.streaming.util.TestStreamEnvironment;
 import org.apache.flink.table.api.EnvironmentSettings;
+import org.apache.flink.table.api.MaterializedPipeline;
+import org.apache.flink.table.api.MaterializedTable;
 import org.apache.flink.table.api.Schema;
+import org.apache.flink.table.api.SqlParserException;
+import org.apache.flink.table.api.Table;
+import org.apache.flink.table.api.TableDescriptor;
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
@@ -55,17 +60,22 @@ import org.apache.flink.table.catalog.CatalogMaterializedTable;
 import org.apache.flink.table.catalog.CatalogMaterializedTable.RefreshMode;
 import org.apache.flink.table.catalog.CatalogMaterializedTable.RefreshStatus;
 import org.apache.flink.table.catalog.GenericInMemoryCatalog;
+import org.apache.flink.table.catalog.IntervalFreshness;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.catalog.ObjectPath;
+import org.apache.flink.table.catalog.ResolvedSchema;
+import org.apache.flink.table.functions.ScalarFunction;
 import org.apache.flink.table.planner.delegation.materializedtable.DefaultMaterializedTableExecutor;
 import org.apache.flink.table.planner.delegation.materializedtable.MaterializedTableTestUtils;
 import org.apache.flink.table.planner.delegation.materializedtable.MaterializedTableTestUtils.FailingCatalog;
 import org.apache.flink.table.refresh.ContinuousRefreshHandler;
+import org.apache.flink.table.types.logical.BigIntType;
 import org.apache.flink.test.junit5.InjectClusterClient;
 import org.apache.flink.test.junit5.InjectMiniCluster;
 import org.apache.flink.test.junit5.MiniClusterExtension;
 import org.apache.flink.testutils.logging.LoggerAuditingExtension;
 import org.apache.flink.types.Row;
+import org.apache.flink.types.RowKind;
 import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.util.NetUtils;
 
@@ -75,6 +85,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.slf4j.event.Level;
 
 import java.nio.file.Files;
@@ -85,10 +98,15 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.apache.flink.table.api.DataTypes.INT;
+import static org.apache.flink.table.api.Expressions.$;
+import static org.apache.flink.table.api.Expressions.call;
+import static org.apache.flink.table.api.Expressions.lit;
 import static org.apache.flink.table.planner.delegation.materializedtable.MaterializedTableTestUtils.hasRefreshStatus;
 import static org.apache.flink.table.planner.delegation.materializedtable.MaterializedTableTestUtils.recordRefreshHandler;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -121,6 +139,7 @@ class MaterializedTableTableApiITCase {
 
     @TempDir private Path savepointDir;
 
+    private StreamExecutionEnvironment executionEnvironment;
     private StreamTableEnvironment tEnv;
     private FailingCatalog catalog;
     private RestClusterClient<?> clusterClient;
@@ -138,10 +157,9 @@ class MaterializedTableTableApiITCase {
         configuration.set(
                 TableConfigOptions.MATERIALIZED_TABLE_CONVERSION_FROM_TABLE_ENABLED, true);
 
-        StreamExecutionEnvironment env =
-                StreamExecutionEnvironment.getExecutionEnvironment(configuration);
-        env.setParallelism(1);
-        tEnv = StreamTableEnvironment.create(env);
+        executionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment(configuration);
+        executionEnvironment.setParallelism(1);
+        tEnv = StreamTableEnvironment.create(executionEnvironment);
         targetMiniClusterFromTableConfig(tEnv);
 
         catalog = new FailingCatalog("mt_cat", DATABASE);
@@ -1133,6 +1151,267 @@ class MaterializedTableTableApiITCase {
                 .hasMessageContaining("Savepoint directory is not configured");
     }
 
+    @Test
+    void materializeIntoCreatesAContinuousMaterializedTable() throws Exception {
+        final MaterializedTable materializedTable =
+                aggregate().materializeInto(MT_NAME, Duration.ofSeconds(30)).execute();
+
+        assertThat(materializedTable.getIdentifier())
+                .isEqualTo(ObjectIdentifier.of("mt_cat", DATABASE, MT_NAME));
+        final CatalogMaterializedTable table = getMaterializedTable();
+        assertThat(table.getRefreshMode()).isEqualTo(RefreshMode.CONTINUOUS);
+        assertThat(table.getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
+        assertThat(table.getOptions()).isEmpty();
+        assertThat(table.getDefinitionFreshness()).isEqualTo(IntervalFreshness.ofSecond(30));
+        awaitAllVerticesRunning(getRefreshJobId());
+    }
+
+    @Test
+    void invalidPathFailsAtMaterializeInto() {
+        assertThatThrownBy(() -> aggregate().materializeInto("a.b.c.d"))
+                .isInstanceOf(SqlParserException.class)
+                .hasMessage("Invalid SQL identifier a.b.c.d.");
+    }
+
+    @Test
+    void invalidFreshnessFailsAtMaterializeInto() {
+        final Table query = aggregate();
+        final Duration aboveIntegerSeconds = Duration.ofSeconds(Integer.MAX_VALUE + 1L);
+
+        assertThatThrownBy(() -> query.materializeInto(MT_NAME, Duration.ZERO))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage("Freshness must be positive, but was: PT0S");
+        assertThatThrownBy(() -> query.materializeInto(MT_NAME, Duration.ofSeconds(-5)))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage("Freshness must be positive, but was: PT-5S");
+        assertThatThrownBy(() -> query.materializeInto(MT_NAME, Duration.ofMillis(1500)))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage("Freshness must be a whole number of seconds, but was: PT1.5S");
+        assertThatThrownBy(() -> query.materializeInto(MT_NAME, aboveIntegerSeconds))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage(
+                        "Freshness must be at most 2147483647 seconds, but was: "
+                                + aboveIntegerSeconds);
+        assertThat(tableExists()).isFalse();
+    }
+
+    @Test
+    void sqlQueryLeafIsStoredFullyQualified() throws Exception {
+        tEnv.sqlQuery("SELECT k, v FROM datagen_source").materializeInto(MT_NAME).execute();
+
+        assertThat(getMaterializedTable().getExpandedQuery())
+                .contains("`mt_cat`.`" + DATABASE + "`.`datagen_source`");
+    }
+
+    @Test
+    void reExecutingAnUnchangedDeclarationRestartsTheRefreshJobWithoutState() throws Exception {
+        final MaterializedPipeline pipeline =
+                aggregate().materializeInto(MT_NAME, Duration.ofSeconds(30));
+        pipeline.execute();
+        final JobID firstJobId = getRefreshJobId();
+        awaitAllVerticesRunning(firstJobId);
+
+        pipeline.execute();
+
+        assertThat(getMaterializedTable().getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
+        final JobID secondJobId = getRefreshJobId();
+        assertThat(secondJobId).isNotEqualTo(firstJobId);
+        assertThat(getRefreshHandler().getRestorePath()).isEmpty();
+        awaitJobStatus(firstJobId, JobStatus.FINISHED);
+        awaitAllVerticesRunning(secondJobId);
+    }
+
+    @Test
+    void reExecutingAChangedDeclarationAppendsANullableColumn() throws Exception {
+        aggregate().materializeInto(MT_NAME, Duration.ofSeconds(30)).execute();
+        final JobID firstJobId = getRefreshJobId();
+        awaitAllVerticesRunning(firstJobId);
+
+        final Table changedQuery =
+                tEnv.from("datagen_source")
+                        .groupBy($("k"))
+                        .select($("k"), $("v").count().as("cnt"), lit(1).count().as("rows"));
+        assertThat(changedQuery.getResolvedSchema().getColumnDataTypes().get(2).getLogicalType())
+                .isEqualTo(new BigIntType(false));
+
+        changedQuery.materializeInto(MT_NAME, Duration.ofSeconds(30)).execute();
+
+        final ResolvedSchema storedSchema = tEnv.from(MT_NAME).getResolvedSchema();
+        assertThat(storedSchema.getColumnNames()).containsExactly("k", "cnt", "rows");
+        assertThat(storedSchema.getColumnDataTypes().get(2).getLogicalType())
+                .isEqualTo(new BigIntType(true));
+        final JobID secondJobId = getRefreshJobId();
+        assertThat(secondJobId).isNotEqualTo(firstJobId);
+        assertThat(getRefreshHandler().getRestorePath()).isEmpty();
+        awaitJobStatus(firstJobId, JobStatus.FINISHED);
+        awaitAllVerticesRunning(secondJobId);
+    }
+
+    @Test
+    void regularTableAtThePathIsRejectedAndKept() throws Exception {
+        createRegularTable();
+        final Set<JobID> jobsBefore = listJobIds();
+
+        assertThatThrownBy(
+                        () ->
+                                aggregate()
+                                        .materializeInto(MT_NAME, Duration.ofSeconds(30))
+                                        .execute())
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining("a regular table with the same identifier exists");
+
+        assertThat(catalog.getTable(new ObjectPath(DATABASE, MT_NAME)).getTableKind())
+                .isEqualTo(TableKind.TABLE);
+        assertThat(listJobIds()).isEqualTo(jobsBefore);
+    }
+
+    @Test
+    void permanentViewAtThePathIsRejected() throws Exception {
+        tEnv.executeSql("CREATE VIEW " + MT_NAME + " AS SELECT k, v FROM datagen_source");
+        final Set<JobID> jobsBefore = listJobIds();
+
+        assertThatThrownBy(() -> aggregate().materializeInto(MT_NAME).execute())
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining(
+                        "does not support the CREATE OR ALTER MATERIALIZED TABLE operation");
+
+        assertThat(catalog.getTable(new ObjectPath(DATABASE, MT_NAME)).getTableKind())
+                .isEqualTo(TableKind.VIEW);
+        assertThat(listJobIds()).isEqualTo(jobsBefore);
+    }
+
+    @Test
+    void temporaryTableAtThePathIsRejected() {
+        tEnv.executeSql(
+                "CREATE TEMPORARY TABLE " + MT_NAME + " (k INT) WITH ('connector' = 'values')");
+
+        assertThatThrownBy(
+                        () ->
+                                aggregate()
+                                        .materializeInto(MT_NAME, Duration.ofSeconds(30))
+                                        .execute())
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining("would shadow it");
+        assertThat(tableExists()).isFalse();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unstorableQueries")
+    void queriesOverTemporaryObjectsOrUnstorableSourcesFailAtMaterializeInto(
+            String description,
+            Function<MaterializedTableTableApiITCase, Table> query,
+            String expectedMessage) {
+        final Table table = query.apply(this);
+
+        assertThatThrownBy(() -> table.materializeInto(MT_NAME))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining(expectedMessage);
+        assertThat(tableExists()).isFalse();
+    }
+
+    private static Stream<Arguments> unstorableQueries() {
+        final String notExpressibleInSql =
+                "The query of a materialized table must be expressible in SQL.";
+        final String temporaryObject =
+                "The query of a materialized table must only reference permanent catalog objects."
+                        + " The refresh job re-runs the stored query text, also from other"
+                        + " sessions, which cannot see the temporary ";
+        return Stream.of(
+                unstorableQuery(
+                        "inline function",
+                        test -> test.aggregate().select(call(new PlusOne(), $("k"))),
+                        notExpressibleInSql),
+                unstorableQuery(
+                        "temporary system function",
+                        test -> {
+                            test.tEnv.createTemporarySystemFunction("plus_one_sys", PlusOne.class);
+                            return test.aggregate().select(call("plus_one_sys", $("k")));
+                        },
+                        temporaryObject + "function plus_one_sys."),
+                unstorableQuery(
+                        "temporary catalog function",
+                        test -> {
+                            test.tEnv.createTemporaryFunction("plus_one_tmp", PlusOne.class);
+                            return test.aggregate().select(call("plus_one_tmp", $("k")));
+                        },
+                        temporaryObject + "function mt_cat.mt_db.plus_one_tmp."),
+                unstorableQuery(
+                        "temporary table",
+                        test -> {
+                            test.createTemporarySource();
+                            return test.tEnv.from("tmp_source");
+                        },
+                        temporaryObject + "table or view mt_cat.mt_db.tmp_source."),
+                unstorableQuery(
+                        "temporary view over a permanent table",
+                        test -> {
+                            test.tEnv.createTemporaryView(
+                                    "tmp_view", test.tEnv.from("datagen_source"));
+                            return test.tEnv.from("tmp_view");
+                        },
+                        temporaryObject + "table or view mt_cat.mt_db.tmp_view."),
+                unstorableQuery(
+                        "temporary function in a subquery",
+                        test -> {
+                            test.tEnv.createTemporarySystemFunction("plus_one_sys", PlusOne.class);
+                            final Table subquery =
+                                    test.tEnv
+                                            .from("datagen_source")
+                                            .select(call("plus_one_sys", $("k")));
+                            return test.aggregate().filter($("k").in(subquery));
+                        },
+                        temporaryObject + "function plus_one_sys."),
+                unstorableQuery(
+                        "DataStream",
+                        test -> test.tEnv.fromDataStream(test.executionEnvironment.fromData(1, 2)),
+                        notExpressibleInSql),
+                unstorableQuery(
+                        "changelog DataStream",
+                        test ->
+                                test.tEnv.fromChangelogStream(
+                                        test.executionEnvironment.fromData(
+                                                Row.ofKind(RowKind.INSERT, 1))),
+                        notExpressibleInSql),
+                unstorableQuery(
+                        "TableDescriptor",
+                        test ->
+                                test.tEnv.from(
+                                        TableDescriptor.forConnector("datagen")
+                                                .schema(
+                                                        Schema.newBuilder()
+                                                                .column("k", INT())
+                                                                .build())
+                                                .build()),
+                        notExpressibleInSql));
+    }
+
+    @Test
+    void sqlDdlOverTemporaryObjectsIsUnaffected() throws Exception {
+        createTemporarySource();
+        tEnv.createTemporaryView("tmp_view", tEnv.from("datagen_source"));
+        tEnv.createTemporarySystemFunction("plus_one_sys", PlusOne.class);
+        final List<String> tableNames =
+                List.of("mt_over_tmp_source", "mt_over_tmp_view", "mt_with_plus_one_sys");
+
+        createContinuousMaterializedTable(
+                tableNames.get(0), "SELECT k, COUNT(v) AS cnt FROM tmp_source GROUP BY k");
+        createContinuousMaterializedTable(
+                tableNames.get(1), "SELECT k, COUNT(v) AS cnt FROM tmp_view GROUP BY k");
+        createContinuousMaterializedTable(
+                tableNames.get(2), "SELECT k, plus_one_sys(k) AS k_plus_one FROM datagen_source");
+
+        for (String tableName : tableNames) {
+            assertThat(
+                            MaterializedTableTestUtils.getMaterializedTable(
+                                            catalog, new ObjectPath(DATABASE, tableName))
+                                    .getRefreshStatus())
+                    .isEqualTo(RefreshStatus.ACTIVATED);
+        }
+        for (String tableName : tableNames) {
+            tEnv.executeSql("DROP MATERIALIZED TABLE " + tableName);
+        }
+    }
+
     private StreamTableEnvironment createTableEnvOnSharedCatalog(EnvironmentSettings settings) {
         return createTableEnvOnSharedCatalog(settings, new Configuration());
     }
@@ -1248,6 +1527,53 @@ class MaterializedTableTableApiITCase {
         };
     }
 
+    private static Arguments unstorableQuery(
+            String description,
+            Function<MaterializedTableTableApiITCase, Table> query,
+            String expectedMessage) {
+        return Arguments.of(description, query, expectedMessage);
+    }
+
+    private void createTemporarySource() {
+        tEnv.executeSql(
+                "CREATE TEMPORARY TABLE tmp_source (\n"
+                        + "  k INT,\n"
+                        + "  v BIGINT\n"
+                        + ") WITH (\n"
+                        + "  'connector' = 'datagen',\n"
+                        + "  'rows-per-second' = '5',\n"
+                        + "  'fields.k.min' = '1',\n"
+                        + "  'fields.k.max' = '3'\n"
+                        + ")");
+    }
+
+    private void createContinuousMaterializedTable(String tableName, String query) {
+        tEnv.executeSql(
+                "CREATE MATERIALIZED TABLE "
+                        + tableName
+                        + " WITH ('connector' = 'values', 'sink-insert-only' = 'false')\n"
+                        + " FRESHNESS = INTERVAL '30' SECOND\n"
+                        + " REFRESH_MODE = CONTINUOUS\n"
+                        + " AS "
+                        + query);
+    }
+
+    private void createRegularTable() {
+        tEnv.executeSql(
+                "CREATE TABLE "
+                        + MT_NAME
+                        + " (k INT, cnt BIGINT)"
+                        + " WITH ('connector' = 'values', 'sink-insert-only' = 'false')");
+    }
+
+    private Table aggregate() {
+        return tEnv.from("datagen_source").groupBy($("k")).select($("k"), $("v").count().as("cnt"));
+    }
+
+    private boolean tableExists() {
+        return catalog.tableExists(new ObjectPath(DATABASE, MT_NAME));
+    }
+
     private CatalogMaterializedTable getMaterializedTable() throws Exception {
         return MaterializedTableTestUtils.getMaterializedTable(
                 catalog, new ObjectPath(DATABASE, MT_NAME));
@@ -1323,6 +1649,13 @@ class MaterializedTableTableApiITCase {
                 TIMEOUT,
                 PAUSE,
                 "Refresh job did not reach a fully RUNNING state in time.");
+    }
+
+    /** A user-defined function for the temporary and inline function cases. */
+    public static class PlusOne extends ScalarFunction {
+        public Integer eval(Integer value) {
+            return value == null ? null : value + 1;
+        }
     }
 
     private static final class ProgramContextEnvironment extends StreamExecutionEnvironment {
