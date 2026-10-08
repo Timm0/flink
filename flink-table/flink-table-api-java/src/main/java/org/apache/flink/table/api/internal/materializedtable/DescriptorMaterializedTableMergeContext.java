@@ -65,6 +65,7 @@ final class DescriptorMaterializedTableMergeContext implements MaterializedTable
     private final MaterializedTableDescriptor descriptor;
     private final QueryOperation queryOperation;
     private final String serializedQuery;
+    private final @Nullable StartMode startMode;
     private final DataTypeFactory dataTypeFactory;
     private final String operationName;
     private final ResolvedSchema querySchema;
@@ -73,11 +74,13 @@ final class DescriptorMaterializedTableMergeContext implements MaterializedTable
             MaterializedTableDescriptor descriptor,
             QueryOperation queryOperation,
             String serializedQuery,
+            @Nullable StartMode startMode,
             CatalogManager catalogManager,
             String operationName) {
         this.descriptor = descriptor;
         this.queryOperation = queryOperation;
         this.serializedQuery = serializedQuery;
+        this.startMode = startMode;
         this.dataTypeFactory = catalogManager.getDataTypeFactory();
         this.operationName = operationName;
         this.querySchema = toPhysicalSchema(queryOperation.getResolvedSchema());
@@ -118,7 +121,6 @@ final class DescriptorMaterializedTableMergeContext implements MaterializedTable
         final List<UnresolvedColumn> declaredColumns = declaredSchema.getColumns();
         for (int position = 0; position < declaredColumns.size(); position++) {
             final UnresolvedColumn column = declaredColumns.get(position);
-            merger.checkNotDeclared(column.getName());
             merger.addDeclaredColumn(withDefaultConversionClass(column), position);
         }
 
@@ -184,8 +186,7 @@ final class DescriptorMaterializedTableMergeContext implements MaterializedTable
 
     @Override
     public @Nullable StartMode getStartMode() {
-        // A descriptor declares no START_MODE, so the configured default applies.
-        return null;
+        return startMode;
     }
 
     @Override

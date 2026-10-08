@@ -20,6 +20,7 @@ package org.apache.flink.table.api;
 
 import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.table.catalog.ObjectIdentifier;
+import org.apache.flink.table.catalog.StartMode;
 
 /**
  * A pending declaration of one materialized table, created by {@link Table#materializeInto(String,
@@ -55,4 +56,16 @@ public interface MaterializedPipeline {
      * once that job has been submitted.
      */
     MaterializedTable execute();
+
+    /**
+     * Submits this declaration with the given start mode, i.e. with the semantics of {@code CREATE
+     * OR ALTER MATERIALIZED TABLE ... START_MODE = ...}. It behaves like {@link #execute()}, but
+     * records the given start mode instead of the default one. The start mode belongs to this call
+     * only, a later {@link #execute()} records the default start mode again.
+     *
+     * @throws ValidationException if the start mode is {@code FROM_TIMESTAMP} or {@code
+     *     RESUME_OR_FROM_TIMESTAMP} without a timestamp; {@link StartMode#fromTimestamp} and {@link
+     *     StartMode#resumeOrFromTimestamp} always set one
+     */
+    MaterializedTable execute(StartMode startMode);
 }

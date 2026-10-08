@@ -28,11 +28,14 @@ import org.apache.flink.table.catalog.CatalogBaseTable.TableKind;
 import org.apache.flink.table.catalog.CatalogManager;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.catalog.ResolvedCatalogBaseTable;
+import org.apache.flink.table.catalog.StartMode;
 import org.apache.flink.table.operations.Operation;
 import org.apache.flink.table.operations.QueryOperation;
 import org.apache.flink.table.operations.materializedtable.MaterializedTableOperationFactory;
 import org.apache.flink.table.operations.materializedtable.MaterializedTableOperationFactory.Mode;
 import org.apache.flink.util.Preconditions;
+
+import javax.annotation.Nullable;
 
 import java.util.Optional;
 
@@ -72,11 +75,22 @@ public final class MaterializedPipelineImpl implements MaterializedPipeline {
 
     @Override
     public MaterializedTable execute() {
-        tableEnvironment.executeInternal(buildOperation());
-        return new MaterializedTableImpl(identifier);
+        return submit(null);
     }
 
-    private Operation buildOperation() {
+    @Override
+    public MaterializedTable execute(StartMode startMode) {
+        Preconditions.checkNotNull(startMode, "Start mode must not be null.");
+        if (StartMode.requiresParameters(startMode.getKind()) && startMode.getTimestamp() == null) {
+            throw new ValidationException(
+                    String.format(
+                            "Start mode %s requires a timestamp. Create it with StartMode.fromTimestamp(Instant) or StartMode.resumeOrFromTimestamp(Instant).",
+                            startMode.getKind()));
+        }
+        return submit(startMode);
+    }
+
+    private Operation buildOperation(@Nullable StartMode startMode) {
         final CatalogManager catalogManager = tableEnvironment.getCatalogManager();
         if (catalogManager.isTemporaryTable(identifier)) {
             throw new ValidationException(
@@ -101,8 +115,14 @@ public final class MaterializedPipelineImpl implements MaterializedPipeline {
                                         descriptor,
                                         queryOperation,
                                         serializedQuery,
+                                        startMode,
                                         catalogManager,
                                         "CREATE OR ALTER MATERIALIZED TABLE"));
+    }
+
+    private MaterializedTable submit(@Nullable StartMode startMode) {
+        tableEnvironment.executeInternal(buildOperation(startMode));
+        return new MaterializedTableImpl(identifier);
     }
 
     @Override

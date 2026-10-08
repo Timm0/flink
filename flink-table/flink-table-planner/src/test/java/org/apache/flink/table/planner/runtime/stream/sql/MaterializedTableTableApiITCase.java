@@ -68,6 +68,7 @@ import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.catalog.ObjectPath;
 import org.apache.flink.table.catalog.ResolvedCatalogMaterializedTable;
 import org.apache.flink.table.catalog.ResolvedSchema;
+import org.apache.flink.table.catalog.StartMode;
 import org.apache.flink.table.functions.ScalarFunction;
 import org.apache.flink.table.planner.delegation.materializedtable.DefaultMaterializedTableExecutor;
 import org.apache.flink.table.planner.delegation.materializedtable.MaterializedTableTestUtils;
@@ -1135,6 +1136,35 @@ class MaterializedTableTableApiITCase {
         assertThat(table.getOptions()).isEmpty();
         assertThat(table.getDefinitionFreshness()).isEqualTo(IntervalFreshness.ofSecond(30));
         awaitAllVerticesRunning(getRefreshJobId());
+    }
+
+    @Test
+    void executeRecordsTheGivenStartMode() throws Exception {
+        final StartMode fromNow = StartMode.fromNow();
+
+        final MaterializedTable materializedTable =
+                aggregate().materializeInto(MT_NAME, continuousDescriptor()).execute(fromNow);
+
+        assertThat(materializedTable.getIdentifier())
+                .isEqualTo(ObjectIdentifier.of("mt_cat", DATABASE, MT_NAME));
+        final CatalogMaterializedTable table = getMaterializedTable();
+        assertThat(table.getRefreshMode()).isEqualTo(RefreshMode.CONTINUOUS);
+        assertThat(table.getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
+        assertThat(table.getStartMode()).contains(fromNow);
+        awaitAllVerticesRunning(getRefreshJobId());
+    }
+
+    @Test
+    void executeRejectsAStartModeWithoutItsRequiredTimestamp() {
+        final MaterializedPipeline pipeline =
+                aggregate().materializeInto(MT_NAME, continuousDescriptor());
+        final StartMode withoutTimestamp = StartMode.of(StartMode.StartModeKind.FROM_TIMESTAMP);
+
+        assertThatThrownBy(() -> pipeline.execute(withoutTimestamp))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage(
+                        "Start mode FROM_TIMESTAMP requires a timestamp. Create it with StartMode.fromTimestamp(Instant) or StartMode.resumeOrFromTimestamp(Instant).");
+        assertThat(tableExists()).isFalse();
     }
 
     @Test
