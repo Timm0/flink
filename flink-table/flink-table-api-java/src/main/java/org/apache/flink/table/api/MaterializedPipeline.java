@@ -22,8 +22,8 @@ import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 
 /**
- * A pending declaration of one materialized table, created by {@link
- * Table#materializeInto(String)}.
+ * A pending declaration of one materialized table, created by {@link Table#materializeInto(String,
+ * MaterializedTableDescriptor)}.
  */
 @PublicEvolving
 public interface MaterializedPipeline {
@@ -39,8 +39,8 @@ public interface MaterializedPipeline {
      * Submits this declaration with the semantics of {@code CREATE OR ALTER MATERIALIZED TABLE}
      * without {@code START_MODE}: creates the materialized table, or alters an existing one, and
      * records the default start mode ({@code materialized-table.default-start-mode}). A changed
-     * freshness has no effect on an existing materialized table. Fails if a regular table, a view,
-     * or a temporary table or view exists at the path.
+     * freshness, comment or partition keys has no effect on an existing materialized table. Fails
+     * if a regular table, a view, or a temporary table or view exists at the path.
      *
      * <p>If the materialized table exists and its continuous refresh job is running, the job is
      * stopped with a savepoint and a new refresh job is started, which does not restore that

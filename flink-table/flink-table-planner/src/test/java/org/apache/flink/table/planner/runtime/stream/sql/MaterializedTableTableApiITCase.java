@@ -45,6 +45,7 @@ import org.apache.flink.streaming.util.TestStreamEnvironment;
 import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.MaterializedPipeline;
 import org.apache.flink.table.api.MaterializedTable;
+import org.apache.flink.table.api.MaterializedTableDescriptor;
 import org.apache.flink.table.api.Schema;
 import org.apache.flink.table.api.SqlParserException;
 import org.apache.flink.table.api.Table;
@@ -54,8 +55,10 @@ import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.table.api.config.ExecutionConfigOptions;
 import org.apache.flink.table.api.config.TableConfigOptions;
+import org.apache.flink.table.api.internal.TableEnvironmentInternal;
 import org.apache.flink.table.catalog.CatalogBaseTable;
 import org.apache.flink.table.catalog.CatalogBaseTable.TableKind;
+import org.apache.flink.table.catalog.CatalogManager;
 import org.apache.flink.table.catalog.CatalogMaterializedTable;
 import org.apache.flink.table.catalog.CatalogMaterializedTable.RefreshMode;
 import org.apache.flink.table.catalog.CatalogMaterializedTable.RefreshStatus;
@@ -63,6 +66,7 @@ import org.apache.flink.table.catalog.GenericInMemoryCatalog;
 import org.apache.flink.table.catalog.IntervalFreshness;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.catalog.ObjectPath;
+import org.apache.flink.table.catalog.ResolvedCatalogMaterializedTable;
 import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.functions.ScalarFunction;
 import org.apache.flink.table.planner.delegation.materializedtable.DefaultMaterializedTableExecutor;
@@ -259,39 +263,6 @@ class MaterializedTableTableApiITCase {
             assertThat(it.hasNext()).isFalse();
         }
         awaitJobStatus(JobID.fromHexString(batchJobId), JobStatus.FINISHED);
-    }
-
-    @Test
-    void fullModeThrows() {
-        String ddl =
-                "CREATE MATERIALIZED TABLE "
-                        + MT_NAME
-                        + " WITH ('connector' = 'values', 'sink-insert-only' = 'false')\n"
-                        + " FRESHNESS = INTERVAL '30' SECOND\n"
-                        + " REFRESH_MODE = FULL\n"
-                        + " AS SELECT k, COUNT(v) AS cnt FROM datagen_source GROUP BY k";
-
-        assertThatThrownBy(() -> tEnv.executeSql(ddl))
-                .isInstanceOf(TableException.class)
-                .hasMessageContaining(
-                        "CREATE MATERIALIZED TABLE on a full-mode materialized table requires a workflow scheduler, which is not configured in this environment");
-        assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isFalse();
-    }
-
-    @Test
-    void automaticRefreshModeResolvingToFullThrows() {
-        final String ddl =
-                "CREATE MATERIALIZED TABLE "
-                        + MT_NAME
-                        + " WITH ('connector' = 'values', 'sink-insert-only' = 'false')\n"
-                        + " FRESHNESS = INTERVAL '1' HOUR\n"
-                        + " AS SELECT k, COUNT(v) AS cnt FROM datagen_source GROUP BY k";
-
-        assertThatThrownBy(() -> tEnv.executeSql(ddl))
-                .isInstanceOf(TableException.class)
-                .hasMessageContaining(
-                        "CREATE MATERIALIZED TABLE on a full-mode materialized table requires a workflow scheduler");
-        assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isFalse();
     }
 
     @Test
@@ -1412,6 +1383,171 @@ class MaterializedTableTableApiITCase {
         }
     }
 
+    @Test
+    void freshnessAtOrAboveTheThresholdResolvesToFullAndIsRejected() {
+        assertThatThrownBy(
+                        () -> aggregate().materializeInto(MT_NAME, Duration.ofHours(1)).execute())
+                .isInstanceOf(TableException.class)
+                .hasMessage(
+                        "CREATE MATERIALIZED TABLE on a full-mode materialized table requires a workflow scheduler, which is not configured in this environment."
+                                + " Only the SQL Gateway provides one, when 'workflow-scheduler.type' is set."
+                                + " The refresh mode was resolved to FULL because the freshness INTERVAL '1' HOUR is not below 'materialized-table.refresh-mode.freshness-threshold'."
+                                + " Declare a continuous refresh mode (REFRESH_MODE = CONTINUOUS in SQL, continuousRefresh() in the Table API) or use a smaller freshness.");
+        assertThat(tableExists()).isFalse();
+    }
+
+    @Test
+    void sqlFreshnessResolvingToFullIsRejectedWithTheThresholdHint() {
+        final String ddl =
+                "CREATE MATERIALIZED TABLE "
+                        + MT_NAME
+                        + " WITH ('connector' = 'values', 'sink-insert-only' = 'false')\n"
+                        + " FRESHNESS = INTERVAL '1' HOUR\n"
+                        + " AS SELECT k, COUNT(v) AS cnt FROM datagen_source GROUP BY k";
+
+        assertThatThrownBy(() -> tEnv.executeSql(ddl))
+                .isInstanceOf(TableException.class)
+                .hasMessageContaining(
+                        "CREATE MATERIALIZED TABLE on a full-mode materialized table requires a workflow scheduler, which is not configured in this environment")
+                .hasMessageContaining(
+                        "The refresh mode was resolved to FULL because the freshness INTERVAL '1' HOUR is not below 'materialized-table.refresh-mode.freshness-threshold'.");
+        assertThat(tableExists()).isFalse();
+    }
+
+    @Test
+    void explicitFullRefreshIsRejectedWithoutTheThresholdHint() {
+        final MaterializedTableDescriptor full = valuesDescriptor().fullRefresh().build();
+
+        assertThatThrownBy(() -> aggregate().materializeInto(MT_NAME, full).execute())
+                .isInstanceOf(TableException.class)
+                .hasMessageContaining(
+                        "CREATE MATERIALIZED TABLE on a full-mode materialized table requires a workflow scheduler, which is not configured in this environment")
+                .hasMessageNotContaining("resolved to FULL");
+        assertThat(tableExists()).isFalse();
+    }
+
+    @Test
+    void rejectedReExecutionKeepsTheJobRunning() throws Exception {
+        aggregate().materializeInto(MT_NAME, continuousDescriptor()).execute();
+        final JobID jobId = getRefreshJobId();
+        awaitAllVerticesRunning(jobId);
+
+        final MaterializedTableDescriptor full = valuesDescriptor().fullRefresh().build();
+        assertThatThrownBy(() -> aggregate().materializeInto(MT_NAME, full).execute())
+                .isInstanceOf(ValidationException.class)
+                .hasMessage("Changing of REFRESH MODE is unsupported");
+
+        final CatalogMaterializedTable table = getMaterializedTable();
+        assertThat(table.getRefreshMode()).isEqualTo(RefreshMode.CONTINUOUS);
+        assertThat(table.getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
+        assertThat(getRefreshJobId()).isEqualTo(jobId);
+        awaitAllVerticesRunning(jobId);
+    }
+
+    @Test
+    void declaredSchemaIsStoredInTheCatalog() throws Exception {
+        tEnv.executeSql(
+                "CREATE TABLE keyed_source (k INT NOT NULL, v BIGINT, ts TIMESTAMP(3)) WITH (\n"
+                        + "  'connector' = 'datagen',\n"
+                        + "  'rows-per-second' = '5',\n"
+                        + "  'fields.k.min' = '1',\n"
+                        + "  'fields.k.max' = '3'\n"
+                        + ")");
+        final MaterializedTableDescriptor descriptor =
+                valuesDescriptor()
+                        .schema(
+                                Schema.newBuilder()
+                                        .columnByExpression("k_plus_one", "k + 1")
+                                        .watermark("ts", "ts - INTERVAL '5' SECOND")
+                                        .primaryKey("k")
+                                        .build())
+                        .continuousRefresh()
+                        .build();
+
+        tEnv.from("keyed_source")
+                .groupBy($("k"))
+                .select($("k"), $("v").sum().as("v"), $("ts").max().as("ts"))
+                .materializeInto(MT_NAME, descriptor)
+                .execute();
+
+        final Schema stored = getMaterializedTable().getUnresolvedSchema();
+        assertThat(stored.getColumns())
+                .extracting(Schema.UnresolvedColumn::getName)
+                .containsExactly("k_plus_one", "k", "v", "ts");
+        assertThat(stored.getPrimaryKey())
+                .map(Schema.UnresolvedPrimaryKey::getColumnNames)
+                .contains(List.of("k"));
+        assertThat(stored.getWatermarkSpecs())
+                .extracting(Schema.UnresolvedWatermarkSpec::getColumnName)
+                .containsExactly("ts");
+        awaitAllVerticesRunning(getRefreshJobId());
+    }
+
+    @Test
+    void fullDeclarationMatchesTheEquivalentSql() throws Exception {
+        // The primary key needs ds to be NOT NULL in the query.
+        tEnv.executeSql(
+                "CREATE TABLE keyed_source ("
+                        + "k INT NOT NULL, v BIGINT, ts TIMESTAMP(3), ds STRING NOT NULL) WITH (\n"
+                        + "  'connector' = 'datagen',\n"
+                        + "  'rows-per-second' = '5',\n"
+                        + "  'fields.k.min' = '1',\n"
+                        + "  'fields.k.max' = '3',\n"
+                        + "  'fields.ds.length' = '1'\n"
+                        + ")");
+        tEnv.executeSql(
+                "CREATE MATERIALIZED TABLE sql_mt (\n"
+                        + "  k_plus_one AS k + 1,\n"
+                        + "  PRIMARY KEY (k, ds) NOT ENFORCED,\n"
+                        + "  WATERMARK FOR ts AS ts - INTERVAL '5' SECOND\n"
+                        + ")\n"
+                        + "COMMENT 'keyed totals'\n"
+                        + "DISTRIBUTED BY HASH(k) INTO 2 BUCKETS\n"
+                        + "PARTITIONED BY (ds)\n"
+                        + "WITH ('connector' = 'values', 'sink-insert-only' = 'false')\n"
+                        + "FRESHNESS = INTERVAL '30' SECOND\n"
+                        + "REFRESH_MODE = CONTINUOUS\n"
+                        + "AS SELECT k, ds, SUM(v) AS v, MAX(ts) AS ts FROM keyed_source GROUP BY k, ds");
+
+        tEnv.from("keyed_source")
+                .groupBy($("k"), $("ds"))
+                .select($("k"), $("ds"), $("v").sum().as("v"), $("ts").max().as("ts"))
+                .materializeInto(
+                        "api_mt",
+                        valuesDescriptor()
+                                .schema(
+                                        Schema.newBuilder()
+                                                .columnByExpression("k_plus_one", "k + 1")
+                                                .watermark("ts", "ts - INTERVAL '5' SECOND")
+                                                .primaryKey("k", "ds")
+                                                .build())
+                                .comment("keyed totals")
+                                .distributedByHash(2, "k")
+                                .partitionedBy("ds")
+                                .continuousRefresh()
+                                .build())
+                .execute();
+
+        final ResolvedCatalogMaterializedTable sqlTable = getResolvedMaterializedTable("sql_mt");
+        final ResolvedCatalogMaterializedTable apiTable = getResolvedMaterializedTable("api_mt");
+        assertThat(apiTable.getResolvedSchema()).isEqualTo(sqlTable.getResolvedSchema());
+        assertThat(apiTable.getOptions()).isEqualTo(sqlTable.getOptions());
+        assertThat(apiTable.getPartitionKeys()).isEqualTo(sqlTable.getPartitionKeys());
+        assertThat(apiTable.getDistribution()).isEqualTo(sqlTable.getDistribution());
+        assertThat(apiTable.getComment()).isEqualTo(sqlTable.getComment());
+        assertThat(apiTable.getDefinitionFreshness()).isEqualTo(sqlTable.getDefinitionFreshness());
+        assertThat(apiTable.getLogicalRefreshMode()).isEqualTo(sqlTable.getLogicalRefreshMode());
+        assertThat(apiTable.getRefreshMode()).isEqualTo(sqlTable.getRefreshMode());
+        assertThat(apiTable.getStartMode()).isEqualTo(sqlTable.getStartMode());
+        for (String tableName : List.of("sql_mt", "api_mt")) {
+            awaitAllVerticesRunning(
+                    JobID.fromHexString(
+                            MaterializedTableTestUtils.getRefreshHandler(
+                                            catalog, new ObjectPath(DATABASE, tableName))
+                                    .getJobId()));
+        }
+    }
+
     private StreamTableEnvironment createTableEnvOnSharedCatalog(EnvironmentSettings settings) {
         return createTableEnvOnSharedCatalog(settings, new Configuration());
     }
@@ -1570,6 +1706,17 @@ class MaterializedTableTableApiITCase {
         return tEnv.from("datagen_source").groupBy($("k")).select($("k"), $("v").count().as("cnt"));
     }
 
+    private static MaterializedTableDescriptor continuousDescriptor() {
+        return valuesDescriptor().continuousRefresh().build();
+    }
+
+    private static MaterializedTableDescriptor.Builder valuesDescriptor() {
+        return MaterializedTableDescriptor.newBuilder()
+                .option("connector", "values")
+                .option("sink-insert-only", "false")
+                .freshness(Duration.ofSeconds(30));
+    }
+
     private boolean tableExists() {
         return catalog.tableExists(new ObjectPath(DATABASE, MT_NAME));
     }
@@ -1577,6 +1724,14 @@ class MaterializedTableTableApiITCase {
     private CatalogMaterializedTable getMaterializedTable() throws Exception {
         return MaterializedTableTestUtils.getMaterializedTable(
                 catalog, new ObjectPath(DATABASE, MT_NAME));
+    }
+
+    private ResolvedCatalogMaterializedTable getResolvedMaterializedTable(String tableName)
+            throws Exception {
+        final CatalogManager catalogManager = ((TableEnvironmentInternal) tEnv).getCatalogManager();
+        return catalogManager.resolveCatalogMaterializedTable(
+                MaterializedTableTestUtils.getMaterializedTable(
+                        catalog, new ObjectPath(DATABASE, tableName)));
     }
 
     private JobID getRefreshJobId() throws Exception {

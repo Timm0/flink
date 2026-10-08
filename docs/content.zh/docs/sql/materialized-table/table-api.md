@@ -27,11 +27,12 @@ under the License.
 A Table API program can declare the query of a `Table` as the definition of a materialized table.
 `Table#materializeInto` builds the same declaration as
 [`CREATE OR ALTER MATERIALIZED TABLE ... AS <query>`]({{< ref "docs/sql/materialized-table/statements" >}})
-without a column list or any clause other than `FRESHNESS`, and `execute()` submits it.
+without `START_MODE`, and `execute()` submits it.
 
 ## Requirements
 
-A declaration has no `WITH` options, so the catalog must provide the storage of the materialized
+Unless the declaration sets a `connector` option with `option(...)` (see
+[Full declaration](#full-declaration)), the catalog must provide the storage of the materialized
 table, as catalogs built for materialized tables do (see
 [Deployment]({{< ref "docs/sql/materialized-table/deployment" >}})).
 
@@ -76,17 +77,56 @@ tEnv.from("orders").materializeInto("orders_copy", Duration.ofMinutes(1)).execut
 ```
 
 The freshness must be a positive whole number of seconds, at most `Integer.MAX_VALUE` seconds.
-Any other freshness fails at `materializeInto(...)` with a `ValidationException`.
+Any other freshness fails at `materializeInto(...)`, or at
+`MaterializedTableDescriptor.Builder#freshness(Duration)`, with a `ValidationException`.
 
 The refresh strategy is automatic: a freshness below
 `materialized-table.refresh-mode.freshness-threshold` runs a continuous
 refresh job. A freshness at or above the threshold resolves to full refresh, which needs a
 workflow scheduler, for example the SQL Gateway, and so fails on a plain `TableEnvironment` with a
-`TableException` stating that a workflow scheduler is required. That specific error only applies
-to a freshness the engine could otherwise schedule. A freshness that cannot be expressed as a cron
-schedule (for example 45 minutes) fails earlier instead, with a `ValidationException`, before the
-engine gets to check for a workflow scheduler. Use a freshness below the threshold, or declare the
-table in SQL with `REFRESH_MODE = CONTINUOUS`, to keep it continuous.
+`TableException` that names the freshness and the threshold option. That specific error only
+applies to a freshness the engine could otherwise schedule. A freshness that cannot be expressed as
+a cron schedule (for example 45 minutes) fails earlier instead, with a `ValidationException`, before
+the engine gets to check for a workflow scheduler. Declare `continuousRefresh()` to keep a long
+freshness continuous.
+
+## Full declaration
+
+```java
+MaterializedTable enriched = tEnv.from("events")
+        .select($("user_id"), $("amount"), $("ts"), $("ds"))
+        .materializeInto("enriched_events", MaterializedTableDescriptor.newBuilder()
+                .schema(Schema.newBuilder()
+                        .columnByExpression("amount_cents", "amount * 100")
+                        .watermark("ts", "ts - INTERVAL '5' SECOND")
+                        .build())
+                .comment("events, kept fresh")
+                .partitionedBy("ds")
+                .option("format", "json")
+                .freshness(Duration.ofMinutes(1))
+                .continuousRefresh()
+                .build())
+        .execute();
+```
+
+The builder methods correspond to the clauses of the SQL statement: `schema(...)` to the column
+list, `comment(...)` to `COMMENT`, `distributedBy...(...)` and `distributedInto(...)` to
+`DISTRIBUTED BY`/`DISTRIBUTED INTO`, `partitionedBy(...)` to `PARTITIONED BY`, `option(...)` to
+`WITH`, `freshness(...)` to `FRESHNESS`, and `continuousRefresh()`/`fullRefresh()` to
+`REFRESH_MODE`.
+
+A declared `Schema` behaves like the schema part of the SQL statement:
+
+- A declared column with the name of a query column overrides its type. The new type must be
+  implicitly castable from the query's type, and the column keeps the query's position.
+- Computed columns and virtual metadata columns may be added. Any declared column the query does
+  not produce is placed before the query's columns, in declaration order.
+- A watermark and a primary key may be declared. Primary key columns must be `NOT NULL` in the
+  query. If the materialized table's storage accepts updates (an upsert sink), the primary key
+  must also contain one of the query's upsert keys with `table.exec.sink.require-on-conflict` at
+  its default (`true`); a mismatch is rejected when the refresh job is submitted.
+- Every declared physical or persisted metadata column must be produced by the query.
+- Indexes and immutable columns are not supported.
 
 ## Redeploying
 
@@ -106,12 +146,18 @@ table in SQL with `REFRESH_MODE = CONTINUOUS`, to keep it continuous.
 Re-executing a changed declaration against an existing materialized table inherits the same
 schema-evolution rules as SQL's
 [`ALTER MATERIALIZED TABLE ... AS`]({{< ref "docs/sql/materialized-table/statements" >}}#as-select_statement-1).
-Only appending nullable columns at the end of the schema is supported.
+Of the query's columns, only appending new ones at the end of the schema is supported: existing
+ones cannot be dropped, and their types cannot change. Unless a declared `Schema` starts with a
+physical column, the appended columns are stored as nullable. An explicitly declared
+refresh strategy (`continuousRefresh()`/`fullRefresh()`) that differs from the table's current
+refresh mode is rejected with a `ValidationException`. The default `automatic()` strategy never
+triggers that check.
 
 If the continuous refresh job is running, the changes to the materialized table are computed and
-validated before the job is stopped. A declaration rejected at that point by the rules above fails
-with a `ValidationException` and leaves the refresh job running and the materialized table
-unchanged. Otherwise the job is stopped with a savepoint and the changes are written to the
+validated before the job is stopped. A declaration rejected at that point by the rules above, or
+because a declared `Schema` conflicts with the query, such as a persisted column the query does not
+produce, fails with a `ValidationException` and leaves the refresh job running and the materialized
+table unchanged. Otherwise the job is stopped with a savepoint and the changes are written to the
 catalog. If that write fails, the materialized table is left `SUSPENDED` with its previous
 definition, and `ALTER MATERIALIZED TABLE ... RESUME` restarts the refresh job from that
 savepoint. If the new refresh job fails to start, the change is rolled back, the previous refresh
@@ -120,14 +166,22 @@ refresh job cannot be restarted either, for example because the cluster cannot b
 materialized table is also left `SUSPENDED`, with its previous definition, and `execute()` fails
 with a `TableException` caused by the error of that restart.
 
-A changed freshness has no effect on an existing materialized table.
+A changed freshness, comment or partition keys has no effect on an existing materialized table.
 
-Re-executing against a materialized table that has `WITH` options or a distribution, such as one
-created in SQL, resets those options and drops the distribution, like a
-`CREATE OR ALTER MATERIALIZED TABLE` statement without those clauses. Its table comment and
-partition keys are kept, and so are its watermark, primary key, and computed and virtual metadata
-columns. Re-executing also records the session's default start mode again, replacing a
-`START_MODE` that a SQL statement declared.
+The declared `WITH` options and distribution replace the stored ones, as in a
+`CREATE OR ALTER MATERIALIZED TABLE` statement: a stored option the declaration omits is reset,
+and a declaration without a distribution drops the stored one. This also applies to a materialized
+table created in SQL. Re-executing also records the session's default start mode again, replacing
+a `START_MODE` that a SQL statement declared.
+
+Without a declared `Schema`, or with one that does not start with a physical column, re-executing
+also keeps parts of the stored schema. The stored watermark stays as it is, even if the
+declaration adds, changes or omits one, and so do stored computed columns, virtual metadata columns
+and a primary key that the declaration omits. The [full declaration](#full-declaration) above has
+this shape, because its schema starts with a computed column, so re-executing it with a different
+watermark keeps the old one. Declaring a physical column first, like a SQL column list that starts
+with a regular column, makes the watermark, the primary key and the computed and virtual metadata
+columns follow the declaration.
 
 `execute()` fails with a `ValidationException` if a regular table or a permanent view exists at
 the path; the Table API does not convert regular tables. It also fails if a temporary table or

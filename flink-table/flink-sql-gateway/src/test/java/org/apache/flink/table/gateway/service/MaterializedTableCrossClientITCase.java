@@ -27,6 +27,7 @@ import org.apache.flink.core.testutils.CommonTestUtils;
 import org.apache.flink.runtime.client.JobStatusMessage;
 import org.apache.flink.streaming.util.TestStreamEnvironment;
 import org.apache.flink.table.api.EnvironmentSettings;
+import org.apache.flink.table.api.MaterializedTableDescriptor;
 import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.api.TableResult;
@@ -60,6 +61,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static org.apache.flink.configuration.CheckpointingOptions.SAVEPOINT_DIRECTORY;
+import static org.apache.flink.table.api.Expressions.$;
+import static org.apache.flink.table.api.Expressions.lit;
 import static org.apache.flink.table.gateway.service.utils.SqlGatewayServiceTestUtil.awaitOperationTermination;
 import static org.apache.flink.test.util.TestUtils.waitUntilAllTasksAreRunning;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -67,8 +70,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests for materialized tables declared through the SQL Gateway or a plain {@link
- * TableEnvironment} and operated through the other, or through a second plain {@link
- * TableEnvironment}.
+ * TableEnvironment}, in SQL or with {@code Table#materializeInto}, and operated through the other,
+ * or through a second plain {@link TableEnvironment}.
  */
 class MaterializedTableCrossClientITCase extends AbstractMaterializedTableStatementITCase {
 
@@ -189,8 +192,19 @@ class MaterializedTableCrossClientITCase extends AbstractMaterializedTableStatem
     }
 
     @Test
-    void programTableIsSuspendedResumedAndDroppedThroughTheGateway() throws Exception {
-        createProgram().executeSql(ddl("CREATE", USERS_SHOPS, CONTINUOUS_QUERY));
+    void tableApiTableIsSuspendedResumedAndDroppedThroughTheGateway() throws Exception {
+        final TableEnvironment program = createProgram();
+        program.from("datagenSource")
+                .groupBy($("user_id"), $("shop_id"))
+                .select($("user_id"), $("shop_id"), lit(1).count().as("cnt"))
+                .materializeInto(
+                        USERS_SHOPS,
+                        MaterializedTableDescriptor.newBuilder()
+                                .option("format", "debezium-json")
+                                .freshness(Duration.ofSeconds(30))
+                                .continuousRefresh()
+                                .build())
+                .execute();
         final JobID programJobId = refreshJobId(USERS_SHOPS);
         waitUntilAllTasksAreRunning(restClusterClient, programJobId);
         executeInGateway(

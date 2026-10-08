@@ -21,11 +21,11 @@ package org.apache.flink.table.api.internal.materializedtable;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.table.api.MaterializedPipeline;
 import org.apache.flink.table.api.MaterializedTable;
+import org.apache.flink.table.api.MaterializedTableDescriptor;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.internal.TableEnvironmentInternal;
 import org.apache.flink.table.catalog.CatalogBaseTable.TableKind;
 import org.apache.flink.table.catalog.CatalogManager;
-import org.apache.flink.table.catalog.IntervalFreshness;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.catalog.ResolvedCatalogBaseTable;
 import org.apache.flink.table.operations.Operation;
@@ -33,8 +33,6 @@ import org.apache.flink.table.operations.QueryOperation;
 import org.apache.flink.table.operations.materializedtable.MaterializedTableOperationFactory;
 import org.apache.flink.table.operations.materializedtable.MaterializedTableOperationFactory.Mode;
 import org.apache.flink.util.Preconditions;
-
-import javax.annotation.Nullable;
 
 import java.util.Optional;
 
@@ -49,19 +47,19 @@ public final class MaterializedPipelineImpl implements MaterializedPipeline {
     private final QueryOperation queryOperation;
     private final String serializedQuery;
     private final ObjectIdentifier identifier;
-    private final @Nullable IntervalFreshness freshness;
+    private final MaterializedTableDescriptor descriptor;
 
     public MaterializedPipelineImpl(
             TableEnvironmentInternal tableEnvironment,
             QueryOperation queryOperation,
             ObjectIdentifier identifier,
-            @Nullable IntervalFreshness freshness) {
+            MaterializedTableDescriptor descriptor) {
         this.tableEnvironment =
                 Preconditions.checkNotNull(tableEnvironment, "Table environment must not be null.");
         this.queryOperation =
                 Preconditions.checkNotNull(queryOperation, "Query operation must not be null.");
         this.identifier = Preconditions.checkNotNull(identifier, "Identifier must not be null.");
-        this.freshness = freshness;
+        this.descriptor = Preconditions.checkNotNull(descriptor, "Descriptor must not be null.");
         this.serializedQuery =
                 MaterializedTableQuerySerializer.serialize(
                         queryOperation, tableEnvironment.getCatalogManager());
@@ -99,8 +97,12 @@ public final class MaterializedPipelineImpl implements MaterializedPipeline {
                         identifier,
                         Mode.CREATE_OR_ALTER,
                         () ->
-                                new QueryMaterializedTableMergeContext(
-                                        queryOperation, serializedQuery, freshness));
+                                new DescriptorMaterializedTableMergeContext(
+                                        descriptor,
+                                        queryOperation,
+                                        serializedQuery,
+                                        catalogManager,
+                                        "CREATE OR ALTER MATERIALIZED TABLE"));
     }
 
     @Override
