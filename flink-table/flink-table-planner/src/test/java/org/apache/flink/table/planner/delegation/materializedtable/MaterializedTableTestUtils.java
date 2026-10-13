@@ -279,9 +279,6 @@ public final class MaterializedTableTestUtils {
         @Nullable private final Deque<JobClient> scriptedJobClients;
         final List<RefreshJobTarget> targets = new ArrayList<>();
 
-        /** The execution configuration of the last submission. */
-        @Nullable Configuration executionConfig;
-
         /** The job id of the last submission. */
         @Nullable String jobId;
 
@@ -303,7 +300,6 @@ public final class MaterializedTableTestUtils {
         public RefreshJobResult submitRefreshJob(
                 RefreshJobTarget target, Configuration executionConfig, String insertStatement) {
             targets.add(target);
-            this.executionConfig = new Configuration(executionConfig);
             if (scriptedJobClients == null) {
                 jobId = new JobID().toHexString();
                 return new RefreshJobResult(target, jobId, null);

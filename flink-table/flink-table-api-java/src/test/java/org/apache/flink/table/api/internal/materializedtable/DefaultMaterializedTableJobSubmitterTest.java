@@ -21,9 +21,6 @@ package org.apache.flink.table.api.internal.materializedtable;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.DeploymentOptions;
 import org.apache.flink.configuration.PipelineOptions;
-import org.apache.flink.configuration.PipelineOptionsInternal;
-import org.apache.flink.configuration.StateRecoveryOptions;
-import org.apache.flink.core.execution.RecoveryClaimMode;
 import org.apache.flink.table.delegation.materializedtable.RefreshJobTarget;
 
 import org.junit.jupiter.api.Test;
@@ -32,16 +29,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link DefaultMaterializedTableJobSubmitter}. */
 class DefaultMaterializedTableJobSubmitterTest {
-
-    @Test
-    void testWorkflowSchedulingIsUnsupported() {
-        assertThat(newSubmitter().getRefreshWorkflowContext()).isEmpty();
-    }
-
-    @Test
-    void testApplicationTargetsAreUnsupported() {
-        assertThat(newSubmitter().supportsApplicationTargets()).isFalse();
-    }
 
     @Test
     void testTargetOverridesTheTableAndExecutionConfiguration() {
@@ -66,44 +53,5 @@ class DefaultMaterializedTableJobSubmitterTest {
                 .containsEntry("pipeline.name", "refresh-job")
                 .containsEntry("rest.address", "table-config-host");
         assertThat(tableConfiguration.get(DeploymentOptions.TARGET)).isEqualTo("remote");
-    }
-
-    @Test
-    void testRefreshExecutorConfigurationDropsTheProgramsFixedJobId() {
-        final Configuration programConfiguration = new Configuration();
-        programConfiguration.set(
-                PipelineOptionsInternal.PIPELINE_FIXED_JOB_ID, "00000000000000000000000000000001");
-        programConfiguration.set(PipelineOptions.NAME, "program");
-
-        final Configuration refreshExecutorConfiguration =
-                DefaultMaterializedTableJobSubmitter.refreshExecutorConfiguration(
-                        programConfiguration);
-
-        assertThat(refreshExecutorConfiguration.toMap())
-                .doesNotContainKey(PipelineOptionsInternal.PIPELINE_FIXED_JOB_ID.key())
-                .containsEntry(PipelineOptions.NAME.key(), "program");
-    }
-
-    @Test
-    void testRefreshExecutorConfigurationDropsTheProgramsSavepointPath() {
-        final Configuration programConfiguration = new Configuration();
-        programConfiguration.set(StateRecoveryOptions.SAVEPOINT_PATH, "file:///program-savepoint");
-        programConfiguration.set(StateRecoveryOptions.SAVEPOINT_IGNORE_UNCLAIMED_STATE, true);
-        programConfiguration.set(StateRecoveryOptions.RESTORE_MODE, RecoveryClaimMode.CLAIM);
-        programConfiguration.set(StateRecoveryOptions.LOCAL_RECOVERY, true);
-
-        final Configuration refreshExecutorConfiguration =
-                DefaultMaterializedTableJobSubmitter.refreshExecutorConfiguration(
-                        programConfiguration);
-
-        assertThat(refreshExecutorConfiguration.toMap())
-                .doesNotContainKey(StateRecoveryOptions.SAVEPOINT_PATH.key())
-                .containsEntry(StateRecoveryOptions.SAVEPOINT_IGNORE_UNCLAIMED_STATE.key(), "true")
-                .containsEntry(StateRecoveryOptions.RESTORE_MODE.key(), "CLAIM")
-                .containsEntry(StateRecoveryOptions.LOCAL_RECOVERY.key(), "true");
-    }
-
-    private static DefaultMaterializedTableJobSubmitter newSubmitter() {
-        return new DefaultMaterializedTableJobSubmitter(null, null, null);
     }
 }

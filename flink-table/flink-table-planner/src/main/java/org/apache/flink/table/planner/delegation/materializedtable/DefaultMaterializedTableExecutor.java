@@ -49,7 +49,6 @@ import org.apache.flink.table.delegation.materializedtable.MaterializedTableExec
 import org.apache.flink.table.delegation.materializedtable.MaterializedTableJobSubmitter;
 import org.apache.flink.table.delegation.materializedtable.RefreshJobResult;
 import org.apache.flink.table.delegation.materializedtable.RefreshJobTarget;
-import org.apache.flink.table.delegation.materializedtable.RefreshJobTargetResolver;
 import org.apache.flink.table.delegation.materializedtable.RefreshWorkflowContext;
 import org.apache.flink.table.operations.ExecutableOperation;
 import org.apache.flink.table.operations.materializedtable.AlterMaterializedTableChangeOperation;
@@ -124,15 +123,21 @@ public class DefaultMaterializedTableExecutor implements MaterializedTableExecut
 
     private final MaterializedTableJobSubmitter jobSubmitter;
 
+    private final RefreshJobTargetResolver targetResolver;
+
     private final RefreshJobController refreshJobController;
 
     public DefaultMaterializedTableExecutor(
             ExecutableOperation.Context operationCtx, MaterializedTableJobSubmitter jobSubmitter) {
         this.operationCtx = operationCtx;
         this.jobSubmitter = jobSubmitter;
+        this.targetResolver =
+                new RefreshJobTargetResolver(
+                        operationCtx.getTableConfig(), jobSubmitter.supportsApplicationTargets());
         this.refreshJobController =
                 new RefreshJobController(
                         operationCtx.getTableConfig(),
+                        targetResolver,
                         operationCtx.getResourceManager().getUserClassLoader());
     }
 
@@ -173,7 +178,7 @@ public class DefaultMaterializedTableExecutor implements MaterializedTableExecut
         ResolvedCatalogMaterializedTable materializedTable =
                 createMaterializedTableOperation.getCatalogMaterializedTable();
         if (RefreshMode.CONTINUOUS == materializedTable.getRefreshMode()) {
-            final RefreshJobTarget target = resolveRefreshJobTarget();
+            final RefreshJobTarget target = targetResolver.resolve();
             createMaterializedTableInContinuousMode(createMaterializedTableOperation, target);
         } else {
             createMaterializedTableInFullMode(
@@ -286,7 +291,7 @@ public class DefaultMaterializedTableExecutor implements MaterializedTableExecut
                 convertOperation.getMaterializedTable();
 
         try {
-            final RefreshJobTarget target = resolveRefreshJobTarget();
+            final RefreshJobTarget target = targetResolver.resolve();
             executeContinuousRefreshJob(
                     catalogMaterializedTable,
                     materializedTableIdentifier,
@@ -582,7 +587,7 @@ public class DefaultMaterializedTableExecutor implements MaterializedTableExecut
                 resolvePinnedRestartTarget(
                                 tableIdentifier,
                                 catalogMaterializedTable.getSerializedRefreshHandler())
-                        .orElseGet(this::resolveRefreshJobTarget);
+                        .orElseGet(targetResolver::resolve);
         final Optional<String> restorePath =
                 deserializeContinuousHandlerIfPresent(
                                 catalogMaterializedTable.getSerializedRefreshHandler())
@@ -673,11 +678,14 @@ public class DefaultMaterializedTableExecutor implements MaterializedTableExecut
                         catalogMaterializedTable.getExpandedQuery(),
                         dynamicOptions);
 
-        final RefreshJobResult result = submitRefreshJob(target, customConfig, insertStatement);
+        final RefreshJobResult result =
+                jobSubmitter.submitRefreshJob(target, customConfig, insertStatement);
         refreshJobController.register(result);
         final ContinuousRefreshHandler continuousRefreshHandler =
                 new ContinuousRefreshHandler(
-                        result.getExecutionTarget(), result.getClusterId(), result.getJobId());
+                        result.getTarget().getExecutionTarget(),
+                        result.getTarget().getClusterId(),
+                        result.getJobId());
 
         try {
             updateRefreshHandler(
@@ -749,7 +757,7 @@ public class DefaultMaterializedTableExecutor implements MaterializedTableExecut
                         : op.getPartitionSpec();
 
         validatePartitionSpec(refreshPartitions, materializedTable);
-        final RefreshJobTarget target = resolveRefreshJobTarget();
+        final RefreshJobTarget target = targetResolver.resolve();
 
         // Set job name, runtime mode
         Configuration customConfig = new Configuration();
@@ -777,9 +785,10 @@ public class DefaultMaterializedTableExecutor implements MaterializedTableExecut
                     "Starting refresh of the materialized table {}, statement: {}",
                     materializedTableIdentifier,
                     insertStatement);
-            final RefreshJobResult result = submitRefreshJob(target, customConfig, insertStatement);
+            final RefreshJobResult result =
+                    jobSubmitter.submitRefreshJob(target, customConfig, insertStatement);
 
-            Row row = Row.of(result.getJobId(), result.getClusterInfo());
+            final Row row = Row.of(result.getJobId(), result.getTarget().toClusterInfo());
             ResolvedSchema schema =
                     ResolvedSchema.of(
                             Column.physical(JOB_ID, DataTypes.STRING()),
@@ -1005,8 +1014,7 @@ public class DefaultMaterializedTableExecutor implements MaterializedTableExecut
 
         // 3. resume the materialized table
         try {
-            final RefreshJobTarget target =
-                    pinnedRestartTarget.orElseGet(this::resolveRefreshJobTarget);
+            final RefreshJobTarget target = pinnedRestartTarget.orElseGet(targetResolver::resolve);
             executeContinuousRefreshJob(
                     alterMaterializedTableChangeOperation.getNewTable(),
                     tableIdentifier,
@@ -1093,7 +1101,7 @@ public class DefaultMaterializedTableExecutor implements MaterializedTableExecut
         }
 
         try {
-            final RefreshJobTarget target = resolveRefreshJobTarget();
+            final RefreshJobTarget target = targetResolver.resolve();
             executeContinuousRefreshJob(
                     suspendedMaterializedTable,
                     op.getTableIdentifier(),
@@ -1368,11 +1376,6 @@ public class DefaultMaterializedTableExecutor implements MaterializedTableExecut
         return builder.toString();
     }
 
-    private RefreshJobTarget resolveRefreshJobTarget() {
-        return RefreshJobTargetResolver.resolve(
-                operationCtx.getTableConfig(), jobSubmitter.supportsApplicationTargets());
-    }
-
     private Optional<RefreshJobTarget> resolvePinnedRestartTarget(
             ObjectIdentifier tableIdentifier, byte[] serializedRefreshHandler) {
         if (jobSubmitter.supportsApplicationTargets()) {
@@ -1381,17 +1384,8 @@ public class DefaultMaterializedTableExecutor implements MaterializedTableExecut
         return deserializeContinuousHandlerIfPresent(serializedRefreshHandler)
                 .map(
                         refreshHandler ->
-                                RefreshJobTargetResolver.resolveOnRecordedCluster(
-                                        operationCtx.getTableConfig(),
-                                        tableIdentifier,
-                                        RefreshJobTargetResolver.recordedTarget(refreshHandler)));
-    }
-
-    private RefreshJobResult submitRefreshJob(
-            RefreshJobTarget target, Configuration executionConfig, String insertStatement) {
-        RefreshJobTargetResolver.pinUnrecordedCoordinates(
-                operationCtx.getTableConfig(), target.getExecutionTarget(), executionConfig);
-        return jobSubmitter.submitRefreshJob(target, executionConfig, insertStatement);
+                                targetResolver.resolveOnRecordedCluster(
+                                        tableIdentifier, refreshHandler));
     }
 
     private String requireSavepointDirectory() {

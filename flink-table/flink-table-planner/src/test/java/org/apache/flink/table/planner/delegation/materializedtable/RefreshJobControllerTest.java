@@ -33,10 +33,14 @@ import org.apache.flink.table.refresh.ContinuousRefreshHandler;
 import org.apache.flink.util.concurrent.FutureUtils;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import javax.annotation.Nullable;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -44,6 +48,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -138,117 +143,174 @@ class RefreshJobControllerTest {
 
     @Test
     void configurationSetAfterCreationIsUsed() {
+        final Configuration root = new Configuration();
+        root.setString("high-availability.type", "zookeeper");
+        tableConfig.setRootConfiguration(root);
         final CapturingRetriever retriever = runningJobRetriever();
         final RefreshJobController controller = controller(retriever);
 
+        tableConfig.set("execution.target", "remote");
         tableConfig.set("rest.address", "late-host");
         controller.getJobStatus(handler("remote", ""));
 
         assertThat(retriever.retrievalConfiguration.toMap())
-                .containsEntry("rest.address", "late-host");
+                .containsEntry("rest.address", "late-host")
+                .doesNotContainKey("high-availability.type");
     }
 
-    @Test
-    void legacyStandaloneClusterIdIsIgnored() {
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("retrievalConfigurations")
+    void unregisteredJobIsRetrievedWithTheRecordedTargetOverTheProgramsLayers(
+            String description,
+            Map<String, String> rootOptions,
+            Map<String, String> tableConfigOptions,
+            String recordedTarget,
+            @Nullable String recordedClusterId,
+            Map<String, String> expectedEntries,
+            List<String> absentKeys) {
+        tableConfig.setRootConfiguration(Configuration.fromMap(rootOptions));
+        tableConfigOptions.forEach(tableConfig::set);
         final CapturingRetriever retriever = runningJobRetriever();
 
-        controller(retriever).getJobStatus(handler("remote", "StandaloneClusterId"));
+        controller(retriever).getJobStatus(handler(recordedTarget, recordedClusterId));
 
         assertThat(retriever.retrievalConfiguration.toMap())
-                .containsEntry("execution.target", "remote")
-                .doesNotContainValue("StandaloneClusterId");
+                .containsAllEntriesOf(expectedEntries)
+                .doesNotContainKeys(absentKeys.toArray(new String[0]));
+    }
+
+    private static Stream<Arguments> retrievalConfigurations() {
+        final List<String> clusterIdKeys = List.of("kubernetes.cluster-id", "yarn.application.id");
+        return Stream.of(
+                Arguments.of(
+                        "old StandaloneClusterId of a remote job",
+                        Map.of(),
+                        Map.of(),
+                        "remote",
+                        "StandaloneClusterId",
+                        Map.of("execution.target", "remote"),
+                        clusterIdKeys),
+                Arguments.of(
+                        "session handler without a cluster id",
+                        Map.of(),
+                        Map.of(
+                                "execution.target", "kubernetes-session",
+                                "kubernetes.cluster-id", "program-cluster"),
+                        "kubernetes-session",
+                        null,
+                        Map.of(
+                                "execution.target", "kubernetes-session",
+                                "kubernetes.cluster-id", "program-cluster"),
+                        List.of()),
+                Arguments.of(
+                        "application target handler",
+                        Map.of("execution.target", "remote", "kubernetes.cluster-id", "other"),
+                        Map.of("execution.target", "remote", "kubernetes.cluster-id", "other"),
+                        "kubernetes-application",
+                        "app-cluster",
+                        Map.of(
+                                "execution.target", "kubernetes-application",
+                                "kubernetes.cluster-id", "app-cluster"),
+                        List.of()),
+                Arguments.of(
+                        "no target on the TableConfig",
+                        Map.of(
+                                "execution.target", "remote",
+                                "rest.address", "root-host",
+                                "high-availability.type", "zookeeper"),
+                        Map.of("rest.address", "table-config-host"),
+                        "remote",
+                        "",
+                        Map.of(
+                                "rest.address", "table-config-host",
+                                "high-availability.type", "zookeeper"),
+                        List.of()),
+                Arguments.of(
+                        "target on the TableConfig strips the root's cluster options",
+                        Map.of(
+                                "rest.address", "program-cluster",
+                                "jobmanager.rpc.address", "program-jobmanager",
+                                "high-availability.type", "zookeeper",
+                                "high-availability.cluster-id", "/program-cluster",
+                                "high-availability", "zookeeper",
+                                "recovery.mode", "zookeeper",
+                                "kubernetes.cluster-id", "program-cluster",
+                                "yarn.application.id", "application_1_0001"),
+                        Map.of("execution.target", "remote", "rest.address", "refresh-cluster"),
+                        "remote",
+                        "",
+                        Map.of("rest.address", "refresh-cluster"),
+                        List.of(
+                                "jobmanager.rpc.address",
+                                "high-availability.type",
+                                "high-availability.cluster-id",
+                                "high-availability",
+                                "recovery.mode",
+                                "kubernetes.cluster-id",
+                                "yarn.application.id")),
+                Arguments.of(
+                        "target on the TableConfig keeps the root's other options",
+                        Map.of(
+                                "rest.address", "program-cluster",
+                                "rest.port", "8082",
+                                "kubernetes.namespace", "flink",
+                                "kubernetes.cluster-id", "program-cluster"),
+                        Map.of(
+                                "execution.target", "kubernetes-session",
+                                "kubernetes.cluster-id", "mt-refresh"),
+                        "kubernetes-session",
+                        "mt-refresh",
+                        Map.of(
+                                "rest.port", "8082",
+                                "kubernetes.namespace", "flink",
+                                "kubernetes.cluster-id", "mt-refresh"),
+                        List.of("rest.address")),
+                Arguments.of(
+                        "deprecated high-availability keys on the TableConfig",
+                        Map.of(
+                                "high-availability.type", "zookeeper",
+                                "high-availability.cluster-id", "/program-cluster"),
+                        Map.of(
+                                "execution.target", "remote",
+                                "rest.address", "refresh-cluster",
+                                "high-availability", "zookeeper",
+                                "high-availability.zookeeper.path.namespace", "/refresh-cluster"),
+                        "remote",
+                        "",
+                        Map.of(
+                                "high-availability", "zookeeper",
+                                "high-availability.zookeeper.path.namespace", "/refresh-cluster"),
+                        List.of("high-availability.type", "high-availability.cluster-id")),
+                Arguments.of(
+                        "another target on the TableConfig, remote job",
+                        Map.of("rest.address", "program-cluster"),
+                        Map.of(
+                                "execution.target", "kubernetes-session",
+                                "rest.address", "standalone-cluster"),
+                        "remote",
+                        "",
+                        Map.of("execution.target", "remote", "rest.address", "standalone-cluster"),
+                        List.of()));
     }
 
     @Test
-    void applicationTargetHandlerIsReachable() {
-        Configuration root = new Configuration();
-        root.setString("execution.target", "remote");
-        root.setString("kubernetes.cluster-id", "other");
-        tableConfig.setRootConfiguration(root);
-        tableConfig.set("execution.target", "remote");
-        tableConfig.set("kubernetes.cluster-id", "other");
-        final CapturingRetriever retriever = runningJobRetriever();
-
-        controller(retriever).getJobStatus(handler("kubernetes-application", "app-cluster"));
-
-        assertThat(retriever.retrievalConfiguration.toMap())
-                .containsEntry("execution.target", "kubernetes-application")
-                .containsEntry("kubernetes.cluster-id", "app-cluster");
-    }
-
-    @Test
-    void tableConfigOverridesTheRootConfigurationForRetrieval() {
-        Configuration root = new Configuration();
-        root.setString("rest.address", "root-host");
-        tableConfig.setRootConfiguration(root);
-        tableConfig.set("rest.address", "table-config-host");
-        final CapturingRetriever retriever = runningJobRetriever();
-
-        controller(retriever).getJobStatus(handler("remote", ""));
-
-        assertThat(retriever.retrievalConfiguration.toMap())
-                .containsEntry("rest.address", "table-config-host");
-    }
-
-    @Test
-    void tableConfigCoordinatesArePinnedForRetrievalWhenItSetsTheTarget() {
-        final Configuration root = new Configuration();
-        root.setString("rest.address", "program-cluster");
-        root.setString("high-availability.type", "zookeeper");
-        tableConfig.setRootConfiguration(root);
-        tableConfig.set("execution.target", "remote");
-        tableConfig.set("jobmanager.rpc.address", "refresh-cluster");
-        final CapturingRetriever retriever = runningJobRetriever();
-
-        controller(retriever).getJobStatus(handler("remote", ""));
-
-        assertThat(retriever.retrievalConfiguration.toMap())
-                .containsEntry("rest.address", "refresh-cluster")
-                .containsEntry("high-availability.type", "NONE");
-    }
-
-    @Test
-    void rootCoordinatesAreKeptForRetrievalWhenTheTableConfigSetsNoTarget() {
-        final Configuration root = new Configuration();
-        root.setString("execution.target", "remote");
-        root.setString("rest.address", "session-cluster");
-        root.setString("high-availability.type", "zookeeper");
-        tableConfig.setRootConfiguration(root);
-        final CapturingRetriever retriever = runningJobRetriever();
-
-        controller(retriever).getJobStatus(handler("remote", ""));
-
-        assertThat(retriever.retrievalConfiguration.toMap())
-                .containsEntry("rest.address", "session-cluster")
-                .containsEntry("high-availability.type", "zookeeper");
-    }
-
-    @Test
-    void retrievalKeepsTheMergedRestAddressWhenTheTableConfigSetsNone() {
+    void retrievalOfARemoteJobRequiresARestAddressOnATableConfigThatSetsAnotherTarget() {
         final Configuration root = new Configuration();
         root.setString("rest.address", "program-cluster");
         tableConfig.setRootConfiguration(root);
         tableConfig.set("execution.target", "kubernetes-session");
-        final CapturingRetriever retriever = runningJobRetriever();
 
-        final JobStatus jobStatus = controller(retriever).getJobStatus(handler("remote", ""));
-
-        assertThat(jobStatus).isEqualTo(JobStatus.RUNNING);
-        assertThat(retriever.retrievalConfiguration.toMap())
-                .containsEntry("rest.address", "program-cluster")
-                .containsEntry("high-availability.type", "NONE");
-    }
-
-    @Test
-    void legacyHandlerWithoutClusterIdIsReachable() {
-        final CapturingRetriever retriever = runningJobRetriever();
-
-        final JobStatus jobStatus = controller(retriever).getJobStatus(handler("remote", null));
-
-        assertThat(jobStatus).isEqualTo(JobStatus.RUNNING);
-        assertThat(retriever.retrievalConfiguration.toMap())
-                .containsEntry("execution.target", "remote")
-                .doesNotContainKeys("kubernetes.cluster-id", "yarn.application.id");
+        assertThatThrownBy(
+                        () ->
+                                controller(
+                                                configuration -> {
+                                                    throw new AssertionError(
+                                                            "A misconfigured job must not be retrieved.");
+                                                })
+                                        .getJobStatus(handler("remote", "")))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining(
+                        "Execution target 'remote' requires 'rest.address' to be configured");
     }
 
     @Test
@@ -278,8 +340,7 @@ class RefreshJobControllerTest {
                         () -> controllerAwaiting(jobStatus).getJobStatus(handler("remote", null)))
                 .isInstanceOf(TableException.class)
                 .hasMessageContaining(jobId.toHexString())
-                .hasMessageContaining("execution.target=remote")
-                .hasMessageNotContaining("cluster id=null");
+                .hasMessageContaining("(execution.target=remote, cluster id=)");
     }
 
     @Test
@@ -579,64 +640,6 @@ class RefreshJobControllerTest {
     }
 
     @Test
-    void retrievalRejectsARemoteTargetOnTableConfigWithoutRestAddress() {
-        final Configuration root = new Configuration();
-        root.setString("rest.address", "program-cluster");
-        tableConfig.setRootConfiguration(root);
-        tableConfig.set("execution.target", "remote");
-
-        assertThatThrownBy(
-                        () ->
-                                controller(
-                                                configuration -> {
-                                                    throw new AssertionError(
-                                                            "A misconfigured job must not be retrieved.");
-                                                })
-                                        .getJobStatus(handler("remote", "")))
-                .isInstanceOf(ValidationException.class)
-                .hasMessageContaining(
-                        "Execution target 'remote' requires 'rest.address' to be configured");
-    }
-
-    @Test
-    void retrievalRejectsHighAvailabilityOnTableConfigWithTheRootClusterIdOnly() {
-        final Configuration root = new Configuration();
-        root.setString("high-availability.cluster-id", "/program-cluster");
-        tableConfig.setRootConfiguration(root);
-        tableConfig.set("execution.target", "remote");
-        tableConfig.set("high-availability.type", "zookeeper");
-
-        assertThatThrownBy(
-                        () ->
-                                controller(
-                                                configuration -> {
-                                                    throw new AssertionError(
-                                                            "A misconfigured job must not be retrieved.");
-                                                })
-                                        .getJobStatus(handler("remote", "")))
-                .isInstanceOf(ValidationException.class)
-                .hasMessageContaining("'high-availability.cluster-id' must be set there too");
-    }
-
-    @Test
-    void restPortOnTableConfigIsPinnedForRetrieval() {
-        final Configuration root = new Configuration();
-        root.setString("rest.address", "program-cluster");
-        root.setString("rest.port", "8081");
-        tableConfig.setRootConfiguration(root);
-        tableConfig.set("execution.target", "remote");
-        tableConfig.set("rest.address", "refresh-cluster");
-        tableConfig.set("rest.port", "9091");
-        final CapturingRetriever retriever = runningJobRetriever();
-
-        controller(retriever).getJobStatus(handler("remote", ""));
-
-        assertThat(retriever.retrievalConfiguration.toMap())
-                .containsEntry("rest.address", "refresh-cluster")
-                .containsEntry("rest.port", "9091");
-    }
-
-    @Test
     void retrievedJobClientIsReusedWithinOneOperationAndClosedAtItsEnd() {
         final CloseableTestingJobClient jobClient =
                 new CloseableTestingJobClient(jobId, JobStatus.RUNNING);
@@ -660,7 +663,11 @@ class RefreshJobControllerTest {
 
     private RefreshJobController controller(
             Function<Configuration, Optional<JobClientRetriever>> retrieverLookup) {
-        return new RefreshJobController(tableConfig, getClass().getClassLoader(), retrieverLookup);
+        return new RefreshJobController(
+                tableConfig,
+                new RefreshJobTargetResolver(tableConfig, false),
+                getClass().getClassLoader(),
+                retrieverLookup);
     }
 
     private RefreshJobController controller(CapturingRetriever retriever) {

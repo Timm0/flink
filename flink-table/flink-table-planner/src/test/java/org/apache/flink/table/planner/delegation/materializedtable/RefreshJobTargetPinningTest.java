@@ -21,9 +21,6 @@ package org.apache.flink.table.planner.delegation.materializedtable;
 import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.DeploymentOptions;
-import org.apache.flink.configuration.HighAvailabilityOptions;
-import org.apache.flink.configuration.JobManagerOptions;
-import org.apache.flink.configuration.RestOptions;
 import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.api.ValidationException;
@@ -37,7 +34,14 @@ import org.apache.flink.table.refresh.ContinuousRefreshHandler;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+
+import javax.annotation.Nullable;
+
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Stream;
 
 import static org.apache.flink.table.planner.delegation.materializedtable.MaterializedTableTestUtils.createTableEnvironment;
 import static org.apache.flink.table.planner.delegation.materializedtable.MaterializedTableTestUtils.getMaterializedTable;
@@ -58,10 +62,16 @@ class RefreshJobTargetPinningTest {
 
     private static final String SESSION_TARGET = "kubernetes-session";
     private static final String CLUSTER_ID_KEY = "kubernetes.cluster-id";
+    private static final String TARGET_KEY = DeploymentOptions.TARGET.key();
+    private static final String CREATE_MATERIALIZED_TABLE =
+            "CREATE MATERIALIZED TABLE "
+                    + MATERIALIZED_TABLE
+                    + "\n FRESHNESS = INTERVAL '30' SECOND"
+                    + "\n REFRESH_MODE = CONTINUOUS"
+                    + "\n AS SELECT k, v FROM datagen_source";
 
     private static final ObjectPath TABLE_PATH = new ObjectPath(DATABASE, MATERIALIZED_TABLE);
     private static final String OTHER_CLUSTER_ID = "B";
-    private static final String APPLICATION_TARGET = "kubernetes-application";
     private static final String SAVEPOINT_DIRECTORY = "file:///savepoints";
     private static final String RESTORE_PATH = "file:///savepoints/savepoint-1";
 
@@ -86,226 +96,277 @@ class RefreshJobTargetPinningTest {
 
     private final GenericInMemoryCatalog catalog = new GenericInMemoryCatalog(CATALOG, DATABASE);
 
-    @Test
-    void testRefreshJobRunsOnAndIsRecordedWithTheResolvedCluster() throws Exception {
-        final Configuration rootConfiguration = new Configuration();
-        rootConfiguration.set(DeploymentOptions.TARGET, SESSION_TARGET);
-        rootConfiguration.setString(CLUSTER_ID_KEY, "A");
-
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unusableTargets")
+    void createWithAnUnusableTargetIsRejectedBeforeAnyCatalogChange(
+            String description,
+            Map<String, String> rootOptions,
+            Map<String, String> tableConfigOptions,
+            List<String> messageParts) {
         final TestingJobSubmitter jobSubmitter = TestingJobSubmitter.recording(false);
-        final TableEnvironment tableEnv = tableEnv(rootConfiguration, jobSubmitter);
-        tableEnv.getConfig().set(CLUSTER_ID_KEY, "B");
+        final TableEnvironment tableEnv =
+                tableEnv(Configuration.fromMap(rootOptions), jobSubmitter);
+        tableConfigOptions.forEach(tableEnv.getConfig()::set);
+        createSourceTable(tableEnv);
+
+        assertThatThrownBy(() -> tableEnv.executeSql(CREATE_MATERIALIZED_TABLE))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContainingAll(messageParts.toArray(new String[0]));
+        assertThat(catalog.tableExists(TABLE_PATH)).isFalse();
+        assertThat(jobSubmitter.targets).isEmpty();
+    }
+
+    private static Stream<Arguments> unusableTargets() {
+        return Stream.of(
+                Arguments.of(
+                        "unset target",
+                        Map.of(),
+                        Map.of(),
+                        List.of(
+                                "Unsupported execution target detected: null",
+                                "(read from 'execution.target' in the "
+                                        + RefreshJobTargetResolver.ROOT_LAYER
+                                        + ")")),
+                Arguments.of(
+                        "embedded target",
+                        Map.of(),
+                        Map.of(TARGET_KEY, "embedded"),
+                        List.of("Execution target 'embedded' is not supported")),
+                Arguments.of(
+                        "target in the root without a cluster id",
+                        Map.of(TARGET_KEY, SESSION_TARGET),
+                        Map.of(),
+                        List.of(
+                                "requires 'kubernetes.cluster-id' to be configured",
+                                "It must be set on TableConfig or the "
+                                        + RefreshJobTargetResolver.ROOT_LAYER)),
+                Arguments.of(
+                        "target on the TableConfig, cluster id only in the root",
+                        Map.of(CLUSTER_ID_KEY, "mt-refresh"),
+                        Map.of(TARGET_KEY, SESSION_TARGET),
+                        List.of(
+                                "requires 'kubernetes.cluster-id' to be configured",
+                                "where 'execution.target' is set")),
+                Arguments.of(
+                        "blank cluster id on the TableConfig",
+                        Map.of(),
+                        Map.of(TARGET_KEY, SESSION_TARGET, CLUSTER_ID_KEY, " "),
+                        List.of("requires 'kubernetes.cluster-id' to be configured")),
+                Arguments.of(
+                        "blank address for remote on the TableConfig",
+                        Map.of(),
+                        Map.of(TARGET_KEY, "remote", "rest.address", " "),
+                        List.of(
+                                "Execution target 'remote' requires 'rest.address' to be configured")),
+                Arguments.of(
+                        "remote on the TableConfig, address and high availability only in the root",
+                        Map.of(
+                                "rest.address",
+                                "program-cluster",
+                                "high-availability.type",
+                                "zookeeper"),
+                        Map.of(TARGET_KEY, "remote"),
+                        List.of(
+                                "Execution target 'remote' requires 'rest.address' to be configured",
+                                "where 'execution.target' is set")));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("resolvedTargets")
+    void createSubmitsToAndRecordsTheResolvedTarget(
+            String description,
+            Map<String, String> rootOptions,
+            Map<String, String> tableConfigOptions,
+            RefreshJobTarget expectedTarget)
+            throws Exception {
+        final TestingJobSubmitter jobSubmitter = TestingJobSubmitter.recording(false);
+        final TableEnvironment tableEnv =
+                tableEnv(Configuration.fromMap(rootOptions), jobSubmitter);
+        tableConfigOptions.forEach(tableEnv.getConfig()::set);
 
         createMaterializedTable(tableEnv);
 
-        assertThat(jobSubmitter.targets).containsExactly(new RefreshJobTarget(SESSION_TARGET, "A"));
-
+        assertThat(jobSubmitter.targets).containsExactly(expectedTarget);
         final ContinuousRefreshHandler refreshHandler = getRefreshHandler(catalog, TABLE_PATH);
-        assertThat(refreshHandler.getExecutionTarget()).isEqualTo(SESSION_TARGET);
-        assertThat(refreshHandler.getClusterId()).isEqualTo("A");
+        assertThat(RefreshJobTarget.recordedIn(refreshHandler)).isEqualTo(expectedTarget);
         assertThat(refreshHandler.getJobId()).isEqualTo(jobSubmitter.jobId);
     }
 
-    @Test
-    void testRestAddressOfARemoteTargetIsPinnedFromTheTableConfig() throws Exception {
-        final Configuration rootConfiguration = new Configuration();
-        rootConfiguration.set(RestOptions.ADDRESS, "program-cluster");
-        final TestingJobSubmitter jobSubmitter = TestingJobSubmitter.recording(false);
-        final TableEnvironment tableEnv = tableEnv(rootConfiguration, jobSubmitter);
-        tableEnv.getConfig().set(DeploymentOptions.TARGET, "remote");
-        tableEnv.getConfig().set(JobManagerOptions.ADDRESS, "refresh-cluster");
-
-        createMaterializedTable(tableEnv);
-
-        assertThat(jobSubmitter.executionConfig.toMap())
-                .containsEntry(RestOptions.ADDRESS.key(), "refresh-cluster");
-
-        tableEnv.executeSql("ALTER MATERIALIZED TABLE " + MATERIALIZED_TABLE + " REFRESH");
-
-        assertThat(jobSubmitter.targets).hasSize(2);
-        assertThat(jobSubmitter.executionConfig.toMap())
-                .containsEntry(RestOptions.ADDRESS.key(), "refresh-cluster");
+    private static Stream<Arguments> resolvedTargets() {
+        return Stream.of(
+                Arguments.of(
+                        "target and cluster id on the TableConfig",
+                        Map.of(),
+                        Map.of(TARGET_KEY, SESSION_TARGET, CLUSTER_ID_KEY, "mt-refresh"),
+                        new RefreshJobTarget(SESSION_TARGET, "mt-refresh")),
+                Arguments.of(
+                        "target and cluster id in the root",
+                        Map.of(
+                                TARGET_KEY,
+                                "yarn-session",
+                                "yarn.application.id",
+                                "application_1_0001"),
+                        Map.of(),
+                        new RefreshJobTarget("yarn-session", "application_1_0001")),
+                Arguments.of(
+                        "target in the root, cluster id only on the TableConfig",
+                        Map.of(TARGET_KEY, SESSION_TARGET),
+                        Map.of(CLUSTER_ID_KEY, "mt-refresh"),
+                        new RefreshJobTarget(SESSION_TARGET, "mt-refresh")),
+                Arguments.of(
+                        "target in the root, the TableConfig's cluster id wins",
+                        Map.of(TARGET_KEY, SESSION_TARGET, CLUSTER_ID_KEY, "A"),
+                        Map.of(CLUSTER_ID_KEY, "B"),
+                        new RefreshJobTarget(SESSION_TARGET, "B")),
+                Arguments.of(
+                        "remote on the TableConfig, reached through jobmanager.rpc.address",
+                        Map.of(),
+                        Map.of(TARGET_KEY, "remote", "jobmanager.rpc.address", "refresh-cluster"),
+                        new RefreshJobTarget("remote", "")),
+                Arguments.of(
+                        "remote on the TableConfig with high availability and no address",
+                        Map.of(),
+                        Map.of(TARGET_KEY, "remote", "high-availability.type", "zookeeper"),
+                        new RefreshJobTarget("remote", "")),
+                Arguments.of(
+                        "remote in the root without an address",
+                        Map.of(TARGET_KEY, "remote"),
+                        Map.of(),
+                        new RefreshJobTarget("remote", "")));
     }
 
-    @Test
-    void testHighAvailabilityOfTheRootIsReplacedWhenTheTableConfigSetsTheTarget() throws Exception {
-        final Configuration rootConfiguration = new Configuration();
-        rootConfiguration.set(HighAvailabilityOptions.HA_MODE, "zookeeper");
-        rootConfiguration.set(HighAvailabilityOptions.HA_CLUSTER_ID, "/program-cluster");
-        final TestingJobSubmitter jobSubmitter = TestingJobSubmitter.recording(false);
-        final TableEnvironment tableEnv = tableEnv(rootConfiguration, jobSubmitter);
-        tableEnv.getConfig().set(DeploymentOptions.TARGET, SESSION_TARGET);
-        tableEnv.getConfig().set(CLUSTER_ID_KEY, "refresh-cluster");
-
-        createMaterializedTable(tableEnv);
-
-        assertThat(jobSubmitter.executionConfig.toMap())
-                .containsEntry(HighAvailabilityOptions.HA_MODE.key(), "NONE")
-                .doesNotContainKey(RestOptions.ADDRESS.key());
-    }
-
-    @Test
-    void testDeprecatedHighAvailabilityKeysOnTheTableConfigArePinned() throws Exception {
-        final Configuration rootConfiguration = new Configuration();
-        rootConfiguration.set(HighAvailabilityOptions.HA_MODE, "kubernetes");
-        rootConfiguration.set(HighAvailabilityOptions.HA_CLUSTER_ID, "/program-cluster");
-        final TestingJobSubmitter jobSubmitter = TestingJobSubmitter.recording(false);
-        final TableEnvironment tableEnv = tableEnv(rootConfiguration, jobSubmitter);
-        tableEnv.getConfig().set(DeploymentOptions.TARGET, SESSION_TARGET);
-        tableEnv.getConfig().set(CLUSTER_ID_KEY, "refresh-cluster");
-        tableEnv.getConfig().set("high-availability", "zookeeper");
-        tableEnv.getConfig().set("high-availability.zookeeper.path.namespace", "/refresh-cluster");
-
-        createMaterializedTable(tableEnv);
-
-        assertThat(jobSubmitter.executionConfig.toMap())
-                .containsEntry(HighAvailabilityOptions.HA_MODE.key(), "zookeeper")
-                .containsEntry(HighAvailabilityOptions.HA_CLUSTER_ID.key(), "/refresh-cluster");
-    }
-
-    @Test
-    void testTargetFromTheRootKeepsTheMergedCoordinates() throws Exception {
-        final Configuration rootConfiguration = new Configuration();
-        rootConfiguration.set(DeploymentOptions.TARGET, "remote");
-        rootConfiguration.set(RestOptions.ADDRESS, "session-cluster");
-        rootConfiguration.set(HighAvailabilityOptions.HA_MODE, "zookeeper");
-        final TestingJobSubmitter jobSubmitter = TestingJobSubmitter.recording(false);
-        final TableEnvironment tableEnv = tableEnv(rootConfiguration, jobSubmitter);
-
-        createMaterializedTable(tableEnv);
-
-        assertThat(jobSubmitter.executionConfig.toMap())
-                .doesNotContainKeys(
-                        RestOptions.ADDRESS.key(), HighAvailabilityOptions.HA_MODE.key());
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {ALTER_AS_QUERY, REDEPLOY})
-    void alterAndRedeployOnAnotherClusterAreRejectedBeforeTheStop(String statement)
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("restartsOnAnotherCluster")
+    void restartOnAnotherClusterIsRejectedBeforeTheJobIsStopped(
+            String description,
+            String statement,
+            RefreshStatus refreshStatus,
+            Map<String, String> programOptions,
+            String programCluster)
             throws Exception {
         final TestingJobSubmitter jobSubmitter = TestingJobSubmitter.recording(false);
         final TableEnvironment tableEnv =
                 tableEnvWithMaterializedTable(sessionClusterA(), jobSubmitter);
+        recordRefreshHandler(
+                catalog,
+                TABLE_PATH,
+                refreshStatus,
+                refreshStatus == RefreshStatus.SUSPENDED
+                        ? new ContinuousRefreshHandler(
+                                SESSION_TARGET, "A", jobSubmitter.jobId, RESTORE_PATH)
+                        : new ContinuousRefreshHandler(SESSION_TARGET, "A", jobSubmitter.jobId));
         final ContinuousRefreshHandler recordedHandler = getRefreshHandler(catalog, TABLE_PATH);
-        targetOtherSessionCluster(tableEnv);
+        programOptions.forEach(tableEnv.getConfig()::set);
+        tableEnv.getConfig().set(CheckpointingOptions.SAVEPOINT_DIRECTORY, SAVEPOINT_DIRECTORY);
 
         assertThatThrownBy(() -> tableEnv.executeSql(statement))
                 .isInstanceOf(ValidationException.class)
-                .hasMessageContaining(
-                        "runs on execution.target 'kubernetes-session', kubernetes.cluster-id 'A'")
-                .hasMessageContaining("kubernetes.cluster-id 'B'");
+                .hasMessageContainingAll(
+                        "runs on execution.target 'kubernetes-session', kubernetes.cluster-id 'A'",
+                        "this program submits refresh jobs to " + programCluster);
 
         assertThat(jobSubmitter.targets).hasSize(1);
         assertThat(getMaterializedTable(catalog, TABLE_PATH).getRefreshStatus())
-                .isEqualTo(RefreshStatus.ACTIVATED);
+                .isEqualTo(refreshStatus);
         assertThat(getRefreshHandler(catalog, TABLE_PATH))
                 .usingRecursiveComparison()
                 .isEqualTo(recordedHandler);
     }
 
-    @Test
-    void resumeOnAnotherClusterIsRejected() throws Exception {
+    private static Stream<Arguments> restartsOnAnotherCluster() {
+        final Map<String, String> otherSessionCluster =
+                Map.of(TARGET_KEY, SESSION_TARGET, CLUSTER_ID_KEY, OTHER_CLUSTER_ID);
+        final String otherSessionClusterDescription =
+                "execution.target 'kubernetes-session', kubernetes.cluster-id 'B'";
+        return Stream.of(
+                Arguments.of(
+                        "alter as query",
+                        ALTER_AS_QUERY,
+                        RefreshStatus.ACTIVATED,
+                        otherSessionCluster,
+                        otherSessionClusterDescription),
+                Arguments.of(
+                        "redeploy",
+                        REDEPLOY,
+                        RefreshStatus.ACTIVATED,
+                        otherSessionCluster,
+                        otherSessionClusterDescription),
+                Arguments.of(
+                        "resume",
+                        RESUME,
+                        RefreshStatus.SUSPENDED,
+                        otherSessionCluster,
+                        otherSessionClusterDescription),
+                Arguments.of(
+                        "resume with another target",
+                        RESUME,
+                        RefreshStatus.SUSPENDED,
+                        Map.of(TARGET_KEY, "remote", "rest.address", "another-standalone-cluster"),
+                        "execution.target 'remote'"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("restartsOnTheProgramsCluster")
+    void resumeRestartsOnTheProgramsClusterWhenItMatchesTheRecordedOne(
+            String description,
+            Map<String, String> rootOptions,
+            String recordedTarget,
+            @Nullable String recordedClusterId,
+            Map<String, String> programOptions,
+            RefreshJobTarget expectedTarget)
+            throws Exception {
         final TestingJobSubmitter jobSubmitter = TestingJobSubmitter.recording(false);
         final TableEnvironment tableEnv =
-                tableEnvWithMaterializedTable(sessionClusterA(), jobSubmitter);
+                tableEnvWithMaterializedTable(Configuration.fromMap(rootOptions), jobSubmitter);
         recordRefreshHandler(
                 catalog,
                 TABLE_PATH,
                 RefreshStatus.SUSPENDED,
                 new ContinuousRefreshHandler(
-                        SESSION_TARGET, "A", jobSubmitter.jobId, RESTORE_PATH));
-        targetOtherSessionCluster(tableEnv);
-
-        assertThatThrownBy(() -> tableEnv.executeSql(RESUME))
-                .isInstanceOf(ValidationException.class)
-                .hasMessageContaining("kubernetes.cluster-id 'A'");
-
-        assertThat(jobSubmitter.targets).hasSize(1);
-        assertThat(getMaterializedTable(catalog, TABLE_PATH).getRefreshStatus())
-                .isEqualTo(RefreshStatus.SUSPENDED);
-    }
-
-    @Test
-    void resumeOfAHandlerWithoutClusterIdRestartsOnTheProgramsCluster() throws Exception {
-        final TestingJobSubmitter jobSubmitter = TestingJobSubmitter.recording(false);
-        final TableEnvironment tableEnv =
-                tableEnvWithMaterializedTable(sessionClusterA(), jobSubmitter);
-        recordRefreshHandler(
-                catalog,
-                TABLE_PATH,
-                RefreshStatus.SUSPENDED,
-                new ContinuousRefreshHandler(SESSION_TARGET, null, jobSubmitter.jobId));
-        targetOtherSessionCluster(tableEnv);
+                        recordedTarget, recordedClusterId, jobSubmitter.jobId, RESTORE_PATH));
+        programOptions.forEach(tableEnv.getConfig()::set);
 
         tableEnv.executeSql(RESUME);
 
-        assertThat(jobSubmitter.targets)
-                .last()
-                .isEqualTo(new RefreshJobTarget(SESSION_TARGET, OTHER_CLUSTER_ID));
+        assertThat(jobSubmitter.targets).hasSize(2).last().isEqualTo(expectedTarget);
+        assertThat(RefreshJobTarget.recordedIn(getRefreshHandler(catalog, TABLE_PATH)))
+                .isEqualTo(expectedTarget);
         assertThat(getMaterializedTable(catalog, TABLE_PATH).getRefreshStatus())
                 .isEqualTo(RefreshStatus.ACTIVATED);
     }
 
-    @Test
-    void resumeOfALegacyRemoteHandlerRestartsOnTheProgramsRemoteTarget() throws Exception {
-        final Configuration rootConfiguration = new Configuration();
-        rootConfiguration.set(DeploymentOptions.TARGET, "remote");
-        final TestingJobSubmitter jobSubmitter = TestingJobSubmitter.recording(false);
-        final TableEnvironment tableEnv =
-                tableEnvWithMaterializedTable(rootConfiguration, jobSubmitter);
-        recordRefreshHandler(
-                catalog,
-                TABLE_PATH,
-                RefreshStatus.SUSPENDED,
-                new ContinuousRefreshHandler(
-                        "remote", "StandaloneClusterId", jobSubmitter.jobId, RESTORE_PATH));
-
-        tableEnv.executeSql(RESUME);
-
-        assertThat(jobSubmitter.targets)
-                .hasSize(2)
-                .last()
-                .isEqualTo(new RefreshJobTarget("remote", ""));
-        assertThat(getMaterializedTable(catalog, TABLE_PATH).getRefreshStatus())
-                .isEqualTo(RefreshStatus.ACTIVATED);
-    }
-
-    @Test
-    void restartsOfAJobInItsOwnApplicationClusterAreRejected() throws Exception {
-        final TestingJobSubmitter jobSubmitter = TestingJobSubmitter.recording(false);
-        final TableEnvironment tableEnv =
-                tableEnvWithMaterializedTable(sessionClusterA(), jobSubmitter);
-        tableEnv.getConfig().set(CheckpointingOptions.SAVEPOINT_DIRECTORY, SAVEPOINT_DIRECTORY);
-        recordRefreshHandler(
-                catalog,
-                TABLE_PATH,
-                RefreshStatus.ACTIVATED,
-                new ContinuousRefreshHandler(APPLICATION_TARGET, "app-1", jobSubmitter.jobId));
-
-        assertThatThrownBy(() -> tableEnv.executeSql(ALTER_AS_QUERY))
-                .isInstanceOf(ValidationException.class)
-                .hasMessageContaining("own application cluster")
-                .hasMessageContaining("SQL Gateway");
-        assertThatThrownBy(() -> tableEnv.executeSql(REDEPLOY))
-                .isInstanceOf(ValidationException.class)
-                .hasMessageContaining("own application cluster");
-        assertThat(getMaterializedTable(catalog, TABLE_PATH).getRefreshStatus())
-                .isEqualTo(RefreshStatus.ACTIVATED);
-
-        recordRefreshHandler(
-                catalog,
-                TABLE_PATH,
-                RefreshStatus.SUSPENDED,
-                new ContinuousRefreshHandler(
-                        APPLICATION_TARGET, "app-1", jobSubmitter.jobId, RESTORE_PATH));
-
-        assertThatThrownBy(() -> tableEnv.executeSql(RESUME))
-                .isInstanceOf(ValidationException.class)
-                .hasMessageContaining("SQL Gateway");
-
-        assertThat(jobSubmitter.targets).hasSize(1);
-        assertThat(getMaterializedTable(catalog, TABLE_PATH).getRefreshStatus())
-                .isEqualTo(RefreshStatus.SUSPENDED);
+    private static Stream<Arguments> restartsOnTheProgramsCluster() {
+        final Map<String, String> sessionClusterA =
+                Map.of(TARGET_KEY, SESSION_TARGET, CLUSTER_ID_KEY, "A");
+        return Stream.of(
+                Arguments.of(
+                        "same cluster id",
+                        sessionClusterA,
+                        SESSION_TARGET,
+                        "A",
+                        Map.of(),
+                        new RefreshJobTarget(SESSION_TARGET, "A")),
+                Arguments.of(
+                        "recorded without a cluster id",
+                        sessionClusterA,
+                        SESSION_TARGET,
+                        null,
+                        Map.of(TARGET_KEY, SESSION_TARGET, CLUSTER_ID_KEY, OTHER_CLUSTER_ID),
+                        new RefreshJobTarget(SESSION_TARGET, OTHER_CLUSTER_ID)),
+                Arguments.of(
+                        "old StandaloneClusterId of a remote job",
+                        Map.of(TARGET_KEY, "remote"),
+                        "remote",
+                        "StandaloneClusterId",
+                        Map.of(),
+                        new RefreshJobTarget("remote", "")),
+                Arguments.of(
+                        "remote job, program at another REST address",
+                        Map.of(TARGET_KEY, "remote", "rest.address", "program-cluster"),
+                        "remote",
+                        "",
+                        Map.of("rest.address", "another-standalone-cluster"),
+                        new RefreshJobTarget("remote", "")));
     }
 
     @Test
@@ -426,14 +487,13 @@ class RefreshJobTargetPinningTest {
     }
 
     private static void createMaterializedTable(TableEnvironment tableEnv) {
+        createSourceTable(tableEnv);
+        tableEnv.executeSql(CREATE_MATERIALIZED_TABLE);
+    }
+
+    private static void createSourceTable(TableEnvironment tableEnv) {
         tableEnv.executeSql(
                 "CREATE TABLE datagen_source (k INT, v BIGINT) WITH ('connector' = 'datagen')");
-        tableEnv.executeSql(
-                "CREATE MATERIALIZED TABLE "
-                        + MATERIALIZED_TABLE
-                        + "\n FRESHNESS = INTERVAL '30' SECOND"
-                        + "\n REFRESH_MODE = CONTINUOUS"
-                        + "\n AS SELECT k, v FROM datagen_source");
     }
 
     private static Configuration sessionClusterA() {

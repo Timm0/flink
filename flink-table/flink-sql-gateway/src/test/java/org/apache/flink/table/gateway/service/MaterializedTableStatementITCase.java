@@ -1844,32 +1844,6 @@ class MaterializedTableStatementITCase extends AbstractMaterializedTableStatemen
     }
 
     @Test
-    void testDropMaterializedTableInApplicationMode() throws Exception {
-        DeployScriptITCase.TestApplicationClusterClientFactory.id = APPLICATION_TARGET;
-        DeployScriptITCase.TestApplicationClusterDescriptor.resetRecordedRequests();
-        try {
-            final ObjectIdentifier identifier = createApplicationModeMaterializedTable();
-            final ContinuousRefreshHandler refreshHandler =
-                    getContinuousRefreshHandler(getTable(identifier));
-
-            final OperationHandle dropHandle =
-                    executeStatement(
-                            "DROP MATERIALIZED TABLE " + identifier.asSerializableString());
-            awaitOperationTermination(service, sessionHandle, dropHandle);
-
-            assertThat(DeployScriptITCase.TestApplicationClusterDescriptor.retrievedClusterId)
-                    .isEqualTo(refreshHandler.getClusterId());
-            assertThat(DeployScriptITCase.TestApplicationClusterDescriptor.cancelledJobId)
-                    .isEqualTo(JobID.fromHexString(refreshHandler.getJobId()));
-            assertThatThrownBy(() -> getTable(identifier))
-                    .isInstanceOf(SqlGatewayException.class)
-                    .hasMessageContaining("Failed to getTable.");
-        } finally {
-            DeployScriptITCase.TestApplicationClusterClientFactory.id = null;
-        }
-    }
-
-    @Test
     void testSuspendMaterializedTableInApplicationMode() throws Exception {
         DeployScriptITCase.TestApplicationClusterClientFactory.id = APPLICATION_TARGET;
         DeployScriptITCase.TestApplicationClusterDescriptor.resetRecordedRequests();

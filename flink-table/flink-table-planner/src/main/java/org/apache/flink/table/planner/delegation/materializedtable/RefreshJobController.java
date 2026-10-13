@@ -32,8 +32,9 @@ import org.apache.flink.core.execution.JobClientRetrieverLoader;
 import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.table.api.TableConfig;
 import org.apache.flink.table.api.TableException;
+import org.apache.flink.table.api.internal.materializedtable.RefreshJobConfiguration;
 import org.apache.flink.table.delegation.materializedtable.RefreshJobResult;
-import org.apache.flink.table.delegation.materializedtable.RefreshJobTargetResolver;
+import org.apache.flink.table.delegation.materializedtable.RefreshJobTarget;
 import org.apache.flink.table.refresh.ContinuousRefreshHandler;
 import org.apache.flink.util.TimeUtils;
 
@@ -78,11 +79,10 @@ final class RefreshJobController {
     private static final String CONFIGURED_COORDINATES_HINT =
             "The job was looked up with coordinates the catalog does not record, such as "
                     + "'rest.address', 'kubernetes.namespace' and high-availability settings, "
-                    + "which are taken from this program's configuration (the REST address and the "
-                    + "high-availability type and cluster id from its TableConfig alone when "
-                    + "'execution.target' is set there; 'rest.port' and the other REST client "
-                    + "options from its TableConfig if set there, otherwise from its merged "
-                    + "configuration) and must point at the cluster the job runs on.";
+                    + "which are taken from this program's configuration and must point at the "
+                    + "cluster the job runs on. If 'execution.target' is set on the TableConfig, "
+                    + "the REST address, high-availability settings and cluster ids of the "
+                    + "execution environment's configuration are ignored.";
 
     private static final String REQUEST_MAY_STILL_COMPLETE =
             "The request may still complete on the cluster, so check the status of the refresh "
@@ -99,6 +99,7 @@ final class RefreshJobController {
                     + "starts the refresh job without restoring state.";
 
     private final TableConfig tableConfig;
+    private final RefreshJobTargetResolver targetResolver;
     private final ClassLoader userClassLoader;
     private final Function<Configuration, Optional<JobClientRetriever>> retrieverLookup;
 
@@ -108,16 +109,25 @@ final class RefreshJobController {
     /** Keyed by job id; only for the current operation, see {@link #releaseRetrievedJobClients}. */
     private final Map<String, JobClient> retrievedJobClients = new HashMap<>();
 
-    RefreshJobController(TableConfig tableConfig, ClassLoader userClassLoader) {
-        this(tableConfig, userClassLoader, JobClientRetrieverLoader::findCompatible);
+    RefreshJobController(
+            TableConfig tableConfig,
+            RefreshJobTargetResolver targetResolver,
+            ClassLoader userClassLoader) {
+        this(
+                tableConfig,
+                targetResolver,
+                userClassLoader,
+                JobClientRetrieverLoader::findCompatible);
     }
 
     @VisibleForTesting
     RefreshJobController(
             TableConfig tableConfig,
+            RefreshJobTargetResolver targetResolver,
             ClassLoader userClassLoader,
             Function<Configuration, Optional<JobClientRetriever>> retrieverLookup) {
         this.tableConfig = checkNotNull(tableConfig);
+        this.targetResolver = checkNotNull(targetResolver);
         this.userClassLoader = checkNotNull(userClassLoader);
         this.retrieverLookup = checkNotNull(retrieverLookup);
     }
@@ -185,8 +195,7 @@ final class RefreshJobController {
             return cachedJobClient;
         }
 
-        RefreshJobTargetResolver.validateUnrecordedCoordinates(
-                tableConfig, refreshHandler.getExecutionTarget());
+        targetResolver.requireRemoteRestAddress(refreshHandler.getExecutionTarget());
         final Optional<JobClient> retrievedJobClient;
         try {
             retrievedJobClient = retrieve(refreshHandler);
@@ -206,9 +215,7 @@ final class RefreshJobController {
     /** Empty when no job client retriever supports the recorded execution target. */
     private Optional<JobClient> retrieve(ContinuousRefreshHandler refreshHandler) throws Exception {
         final Configuration retrievalConfiguration = programConfiguration();
-        RefreshJobTargetResolver.recordedTarget(refreshHandler).applyTo(retrievalConfiguration);
-        RefreshJobTargetResolver.pinUnrecordedCoordinates(
-                tableConfig, refreshHandler.getExecutionTarget(), retrievalConfiguration);
+        RefreshJobTarget.recordedIn(refreshHandler).applyTo(retrievalConfiguration);
         final Optional<JobClientRetriever> retriever =
                 retrieverLookup.apply(retrievalConfiguration);
         if (retriever.isEmpty()) {
@@ -226,7 +233,7 @@ final class RefreshJobController {
     /** Read on every retrieval, so options set after this controller was created still apply. */
     private Configuration programConfiguration() {
         final Configuration configuration =
-                Configuration.fromMap(tableConfig.getRootConfiguration().toMap());
+                RefreshJobConfiguration.rootLayer(tableConfig.getRootConfiguration(), tableConfig);
         configuration.addAll(tableConfig.getConfiguration());
         return configuration;
     }
@@ -329,7 +336,7 @@ final class RefreshJobController {
                 "%s (execution.target=%s, cluster id=%s)",
                 String.format(action, refreshHandler.getJobId()),
                 refreshHandler.getExecutionTarget(),
-                RefreshJobTargetResolver.recordedTarget(refreshHandler).getClusterId());
+                RefreshJobTarget.recordedIn(refreshHandler).getClusterId());
     }
 
     /** A request sent to a refresh job: how long it is awaited and what its failure tells. */

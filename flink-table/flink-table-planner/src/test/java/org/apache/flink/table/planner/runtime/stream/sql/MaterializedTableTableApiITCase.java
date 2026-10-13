@@ -25,8 +25,10 @@ import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.DeploymentOptions;
 import org.apache.flink.configuration.HighAvailabilityOptions;
+import org.apache.flink.configuration.JobManagerOptions;
 import org.apache.flink.configuration.PipelineOptionsInternal;
 import org.apache.flink.configuration.RestOptions;
+import org.apache.flink.configuration.StateRecoveryOptions;
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.core.testutils.CommonTestUtils;
 import org.apache.flink.runtime.client.JobStatusMessage;
@@ -50,6 +52,7 @@ import org.apache.flink.table.api.Schema;
 import org.apache.flink.table.api.SqlParserException;
 import org.apache.flink.table.api.Table;
 import org.apache.flink.table.api.TableDescriptor;
+import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
@@ -93,6 +96,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.event.Level;
 
 import java.nio.file.Files;
@@ -103,6 +107,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -314,58 +319,40 @@ class MaterializedTableTableApiITCase {
     }
 
     @Test
-    void createRejectsAClusterIdFromAnotherConfigurationLayer() {
-        Configuration envConfiguration = new Configuration();
-        envConfiguration.setString("kubernetes.cluster-id", "mt-refresh");
-        StreamTableEnvironment otherEnv =
-                createTableEnvOnSharedCatalog(
-                        EnvironmentSettings.inStreamingMode(), envConfiguration);
-        otherEnv.getConfig().set(DeploymentOptions.TARGET, "kubernetes-session");
-
-        assertThatThrownBy(() -> otherEnv.executeSql(continuousMaterializedTableDdl()))
-                .isInstanceOf(ValidationException.class)
-                .hasMessageContaining("'kubernetes.cluster-id'")
-                .hasMessageContaining("TableConfig");
-        assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isFalse();
-    }
-
-    @Test
-    void refreshJobIgnoresTheEnvironmentsHighAvailabilityWhenTheTableConfigSetsTheTarget()
+    void refreshJobsAndTheirControlIgnoreTheEnvironmentsClusterWhenTheTableConfigSetsTheTarget()
             throws Exception {
-        final StreamTableEnvironment envWithHighAvailability =
-                createTableEnvOnSharedCatalog(
-                        EnvironmentSettings.inStreamingMode(), unreachableHighAvailability());
+        createTableEnvOnSharedCatalogWithAnUnreachableClusterInTheRoot()
+                .executeSql(continuousMaterializedTableDdl());
+        final JobID refreshJobId = getRefreshJobId();
+        awaitAllVerticesRunning(refreshJobId);
 
-        envWithHighAvailability.executeSql(continuousMaterializedTableDdl());
+        createTableEnvOnSharedCatalogWithAnUnreachableClusterInTheRoot()
+                .executeSql("DROP MATERIALIZED TABLE " + MT_NAME);
 
-        awaitAllVerticesRunning(getRefreshJobId());
+        assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isFalse();
+        awaitJobStatus(refreshJobId, JobStatus.CANCELED);
     }
 
     @Test
-    void refreshJobBypassesTheProgramsContextEnvironment() throws Exception {
-        ProgramContextEnvironment.setAsContext();
-        try {
-            tEnv.executeSql(continuousMaterializedTableDdl());
-        } finally {
-            ProgramContextEnvironment.unsetAsContext();
-        }
-
-        awaitAllVerticesRunning(getRefreshJobId());
-    }
-
-    @Test
-    void refreshJobsDoNotInheritTheProgramsFixedJobId() throws Exception {
+    void refreshJobsBypassTheProgramsEnvironmentAndItsFixedJobIdAndSavepointPath()
+            throws Exception {
         final Configuration envConfiguration = new Configuration();
         envConfiguration.set(
                 PipelineOptionsInternal.PIPELINE_FIXED_JOB_ID, new JobID().toHexString());
-        final StreamTableEnvironment applicationEnv =
-                createTableEnvOnSharedCatalog(
-                        EnvironmentSettings.inStreamingMode(), envConfiguration);
+        envConfiguration.set(StateRecoveryOptions.SAVEPOINT_PATH, "file:///no-such-savepoint");
         final String secondTable = MT_NAME + "_2";
 
-        applicationEnv.executeSql(continuousMaterializedTableDdl());
-        applicationEnv.executeSql(
-                continuousMaterializedTableDdl().replaceFirst(MT_NAME, secondTable));
+        ProgramContextEnvironment.setAsContext();
+        try {
+            final StreamTableEnvironment applicationEnv =
+                    createTableEnvOnSharedCatalog(
+                            EnvironmentSettings.inStreamingMode(), envConfiguration);
+            applicationEnv.executeSql(continuousMaterializedTableDdl());
+            applicationEnv.executeSql(
+                    continuousMaterializedTableDdl().replaceFirst(MT_NAME, secondTable));
+        } finally {
+            ProgramContextEnvironment.unsetAsContext();
+        }
 
         final JobID firstJobId = getRefreshJobId();
         final JobID secondJobId =
@@ -870,21 +857,6 @@ class MaterializedTableTableApiITCase {
     }
 
     @Test
-    void dropFromAnotherSessionIgnoresTheEnvironmentsHAWhenTheTableConfigSetsTheTarget()
-            throws Exception {
-        tEnv.executeSql(continuousMaterializedTableDdl());
-        final JobID refreshJobId = getRefreshJobId();
-        awaitAllVerticesRunning(refreshJobId);
-
-        createTableEnvOnSharedCatalog(
-                        EnvironmentSettings.inStreamingMode(), unreachableHighAvailability())
-                .executeSql("DROP MATERIALIZED TABLE " + MT_NAME);
-
-        assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isFalse();
-        awaitJobStatus(refreshJobId, JobStatus.CANCELED);
-    }
-
-    @Test
     void alterAsQueryFromAnotherSession() throws Exception {
         tEnv.executeSql(continuousMaterializedTableDdl());
         JobID originalJobId = getRefreshJobId();
@@ -999,6 +971,39 @@ class MaterializedTableTableApiITCase {
                                 .getJobVertexInfos())
                 .extracting(JobDetailsInfo.JobVertexDetailsInfo::getName)
                 .anySatisfy(name -> assertThat(name).contains("GroupAggregate"));
+    }
+
+    @ParameterizedTest(name = "streaming mode: {0}")
+    @ValueSource(booleans = {true, false})
+    void createAndDropWithTheClusterOnlyInTheEnvironmentsConfiguration(boolean streamingMode)
+            throws Exception {
+        final StreamTableEnvironment rootTargetEnv =
+                createTableEnvOnSharedCatalogWithTheClusterOnlyInTheRoot(
+                        streamingMode
+                                ? EnvironmentSettings.inStreamingMode()
+                                : EnvironmentSettings.inBatchMode());
+        rootTargetEnv.executeSql(
+                "CREATE TABLE slow_bounded_source (\n"
+                        + "  k INT,\n"
+                        + "  v BIGINT\n"
+                        + ") WITH (\n"
+                        + "  'connector' = 'datagen',\n"
+                        + "  'number-of-rows' = '1000000',\n"
+                        + "  'rows-per-second' = '5',\n"
+                        + "  'fields.k.min' = '1',\n"
+                        + "  'fields.k.max' = '3'\n"
+                        + ")");
+
+        aggregate(rootTargetEnv, "slow_bounded_source")
+                .materializeInto(MT_NAME, continuousDescriptor())
+                .execute();
+        final JobID refreshJobId = getRefreshJobId();
+        awaitAllVerticesRunning(refreshJobId);
+
+        rootTargetEnv.executeSql("DROP MATERIALIZED TABLE " + MT_NAME);
+
+        assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isFalse();
+        awaitJobStatus(refreshJobId, JobStatus.CANCELED);
     }
 
     @Test
@@ -1592,6 +1597,30 @@ class MaterializedTableTableApiITCase {
 
     private StreamTableEnvironment createTableEnvOnSharedCatalog(
             EnvironmentSettings settings, Configuration envConfiguration) {
+        return createTableEnvOnSharedCatalog(
+                settings,
+                envConfiguration,
+                MaterializedTableTableApiITCase::targetMiniClusterFromTableConfig);
+    }
+
+    /**
+     * The root names a cluster that can't be reached, by REST address and by high availability; the
+     * TableConfig reaches the MiniCluster only through 'jobmanager.rpc.address'.
+     */
+    private StreamTableEnvironment
+            createTableEnvOnSharedCatalogWithAnUnreachableClusterInTheRoot() {
+        final Configuration envConfiguration = unreachableHighAvailability();
+        envConfiguration.set(RestOptions.ADDRESS, "unreachable.invalid");
+        return createTableEnvOnSharedCatalog(
+                EnvironmentSettings.inStreamingMode(),
+                envConfiguration,
+                MaterializedTableTableApiITCase::targetMiniClusterByRpcAddressFromTableConfig);
+    }
+
+    private StreamTableEnvironment createTableEnvOnSharedCatalog(
+            EnvironmentSettings settings,
+            Configuration envConfiguration,
+            Consumer<StreamTableEnvironment> targetMiniCluster) {
         Configuration configuration = new Configuration(MINI_CLUSTER.getClientConfiguration());
         configuration.addAll(envConfiguration);
         configuration.set(DeploymentOptions.TARGET, "remote");
@@ -1600,11 +1629,26 @@ class MaterializedTableTableApiITCase {
                 StreamExecutionEnvironment.getExecutionEnvironment(configuration);
         env.setParallelism(1);
         StreamTableEnvironment otherEnv = StreamTableEnvironment.create(env, settings);
-        targetMiniClusterFromTableConfig(otherEnv);
+        targetMiniCluster.accept(otherEnv);
         otherEnv.registerCatalog("mt_cat", catalog);
         otherEnv.useCatalog("mt_cat");
         otherEnv.useDatabase(DATABASE);
         return otherEnv;
+    }
+
+    private StreamTableEnvironment createTableEnvOnSharedCatalogWithTheClusterOnlyInTheRoot(
+            EnvironmentSettings settings) {
+        final Configuration configuration =
+                new Configuration(MINI_CLUSTER.getClientConfiguration());
+        configuration.set(DeploymentOptions.TARGET, "remote");
+
+        final StreamExecutionEnvironment env = new StreamExecutionEnvironment(configuration);
+        env.setParallelism(1);
+        final StreamTableEnvironment rootTargetEnv = StreamTableEnvironment.create(env, settings);
+        rootTargetEnv.registerCatalog("mt_cat", catalog);
+        rootTargetEnv.useCatalog("mt_cat");
+        rootTargetEnv.useDatabase(DATABASE);
+        return rootTargetEnv;
     }
 
     private StreamTableEnvironment createTableEnvRegisteringTheCatalogAs(String catalogName) {
@@ -1631,6 +1675,15 @@ class MaterializedTableTableApiITCase {
                 .set(
                         RestOptions.ADDRESS,
                         MINI_CLUSTER.getClientConfiguration().get(RestOptions.ADDRESS));
+    }
+
+    private static void targetMiniClusterByRpcAddressFromTableConfig(
+            StreamTableEnvironment tableEnv) {
+        tableEnv.getConfig().set(DeploymentOptions.TARGET, "remote");
+        tableEnv.getConfig()
+                .set(
+                        JobManagerOptions.ADDRESS,
+                        MINI_CLUSTER.getClientConfiguration().get(JobManagerOptions.ADDRESS));
     }
 
     private static Configuration unreachableHighAvailability() {
@@ -1733,7 +1786,11 @@ class MaterializedTableTableApiITCase {
     }
 
     private Table aggregate() {
-        return tEnv.from("datagen_source").groupBy($("k")).select($("k"), $("v").count().as("cnt"));
+        return aggregate(tEnv, "datagen_source");
+    }
+
+    private static Table aggregate(TableEnvironment tableEnv, String sourceTable) {
+        return tableEnv.from(sourceTable).groupBy($("k")).select($("k"), $("v").count().as("cnt"));
     }
 
     private static MaterializedTableDescriptor continuousDescriptor() {

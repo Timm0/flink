@@ -39,16 +39,26 @@ table, as catalogs built for materialized tables do (see
 `execute()` submits the refresh job by running an `INSERT INTO` statement, which needs a
 session-style cluster deployment target (`execution.target`), for example `remote`,
 `yarn-session` or `kubernetes-session`. A `yarn`-/`kubernetes`-prefixed target also needs its
-cluster id (`yarn.application.id` or `kubernetes.cluster-id`), set in the same configuration as
-`execution.target`. Whenever `execute()` would start a refresh job, an unset target, `local`,
-`embedded`, an application-mode target (one ending in `application`) or a missing cluster id
-fails it with a `ValidationException` before anything is written; when redeploying, before the
-running refresh job is stopped. A redeploy restarts the refresh job only with the target and
-cluster id recorded in the catalog; a different target or cluster id fails the same way and keeps
-the job running.
+cluster id (`yarn.application.id` or `kubernetes.cluster-id`). If `execution.target` is set on the
+`TableConfig`, the cluster id must be set there too, otherwise it is read from the `TableConfig`
+or the execution environment's configuration, and the `TableConfig` wins. Whenever `execute()`
+would start a refresh job, an unset target, `local`, `embedded`, an application-mode target or a
+missing cluster id fails it with a `ValidationException` before anything is written. A redeploy
+restarts the refresh job only with the target and cluster id recorded in the catalog. A different
+target or cluster id fails the same way and keeps the job running. The catalog records no address,
+so for `remote` only the target is compared.
 Re-executing a declaration whose materialized table has a running continuous refresh job
 additionally needs `execution.checkpointing.savepoint-dir` set, to stop that job with a savepoint
 (see [Redeploying](#redeploying)).
+
+A program deployed in application mode or submitted through the web UI must set `execution.target` and the
+cluster id of a session cluster (or `rest.address` for `remote`) on its `TableConfig`, with
+`TableConfig#set`, SQL `SET` or `EnvironmentSettings.Builder#withConfiguration`. If a program's
+`TableConfig` sets `execution.target`, the refresh jobs it submits and controls ignore the options
+of its execution environment's configuration that select a cluster. All other options, such as
+`rest.port`, `kubernetes.namespace` and the client SSL settings, are read from both configurations. See
+[Table API programs]({{< ref "docs/sql/materialized-table/deployment" >}}#table-api-programs) for
+the options of each session cluster and for high availability.
 
 ## Minimal declaration
 

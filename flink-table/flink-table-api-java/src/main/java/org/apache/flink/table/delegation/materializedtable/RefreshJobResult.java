@@ -23,7 +23,6 @@ import org.apache.flink.core.execution.JobClient;
 
 import javax.annotation.Nullable;
 
-import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -52,21 +51,12 @@ public final class RefreshJobResult {
                 jobId);
     }
 
-    public String getExecutionTarget() {
-        return target.getExecutionTarget();
-    }
-
-    public String getClusterId() {
-        return target.getClusterId();
+    public RefreshJobTarget getTarget() {
+        return target;
     }
 
     public String getJobId() {
         return jobId;
-    }
-
-    public Map<String, String> getClusterInfo() {
-        return MaterializedTableClusterUtils.buildClusterInfo(
-                target.getExecutionTarget(), target.getClusterId());
     }
 
     public Optional<JobClient> getJobClient() {

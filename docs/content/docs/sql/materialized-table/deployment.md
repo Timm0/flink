@@ -49,7 +49,7 @@ Materialized Table refresh jobs currently support execution in these cluster env
 
 ## Flink SQL Gateway Deployment
 
-Materialized Tables must be created through SQL Gateway, which requires specific configurations for metadata persistence and job scheduling.
+Materialized Tables in full refresh mode must be created through SQL Gateway, which schedules their refresh workflows. SQL Gateway requires specific configurations for metadata persistence and job scheduling. Materialized Tables in continuous refresh mode can also be created from Table API programs (see [Table API Programs](#table-api-programs)).
 
 ### Configure Catalog Store
 
@@ -99,7 +99,7 @@ Example using SQL Client:
 ### Refresh Jobs Running on Standalone Cluster
 
 ```sql
-Flink SQL> SET 'execution.mode' = 'remote';
+Flink SQL> SET 'execution.target' = 'remote';
 [INFO] Execute statement succeeded.
 
 FLINK SQL> CREATE MATERIALIZED TABLE my_materialized_table
@@ -114,7 +114,7 @@ For session modes, pre-create session cluster as documented in  [yarn-session]({
 **Kubernetes session mode:**
 
 ```sql
-Flink SQL> SET 'execution.mode' = 'kubernetes-session';
+Flink SQL> SET 'execution.target' = 'kubernetes-session';
 [INFO] Execute statement succeeded.
 
 Flink SQL> SET 'kubernetes.cluster-id' = 'flink-cluster-mt-session-1';
@@ -124,12 +124,12 @@ Flink SQL> CREATE MATERIALIZED TABLE my_materialized_table
 > ... ;
 [INFO] Execute statement succeeded.
 ```
-Set `execution.mode` to `kubernetes-session` and specify a valid `kubernetes.cluster-id` corresponding to an existing Kubernetes session cluster.
+Set `execution.target` to `kubernetes-session` and specify a valid `kubernetes.cluster-id` corresponding to an existing Kubernetes session cluster.
 
 **YARN session mode:**
 
 ```sql
-Flink SQL> SET 'execution.mode' = 'yarn-session';
+Flink SQL> SET 'execution.target' = 'yarn-session';
 [INFO] Execute statement succeeded.
 
 Flink SQL> SET 'yarn.application.id' = 'application-xxxx';
@@ -139,14 +139,14 @@ Flink SQL> CREATE MATERIALIZED TABLE my_materialized_table
 > ... ;
 [INFO] Execute statement succeeded.
 ```
-Set `execution.mode` to `yarn-session` and specify a valid `yarn.application.id` corresponding to an existing YARN session cluster.
+Set `execution.target` to `yarn-session` and specify a valid `yarn.application.id` corresponding to an existing YARN session cluster.
 
 ### Refresh Jobs Running in Application Mode
 
 **Kubernetes application mode:**
 
 ```sql
-Flink SQL> SET 'execution.mode' = 'kubernetes-application';
+Flink SQL> SET 'execution.target' = 'kubernetes-application';
 [INFO] Execute statement succeeded.
 
 Flink SQL> SET 'kubernetes.cluster-id' = 'flink-cluster-mt-application-1';
@@ -156,23 +156,23 @@ Flink SQL> CREATE MATERIALIZED TABLE my_materialized_table
 > ... ;
 [INFO] Execute statement succeeded.
 ```
-Set `execution.mode` to `kubernetes-application`. The `kubernetes.cluster-id` is optional; if not set, it will be automatically generated.
+Set `execution.target` to `kubernetes-application`. The `kubernetes.cluster-id` is optional; if not set, it will be automatically generated.
 
 **YARN application mode:**
 
 ```sql
-Flink SQL> SET 'execution.mode' = 'yarn-application';
+Flink SQL> SET 'execution.target' = 'yarn-application';
 [INFO] Execute statement succeeded.
 
 Flink SQL> CREATE MATERIALIZED TABLE my_materialized_table
 > ... ;
 [INFO] Execute statement succeeded.
 ```
-Only set `execution.mode` to yarn-application. The `yarn.application.id` doesn’t need to be set; it will be automatically generated during submission.
+Only set `execution.target` to yarn-application. The `yarn.application.id` doesn’t need to be set; it will be automatically generated during submission.
 
 ## Maintenance Operations
 
-Cluster information (e.g., `execution.mode` or `kubernetes.cluster-id`) is already persisted in the catalog and does not need to be set when suspend or resume the refresh jobs of Materialized Table.
+Cluster information (e.g., `execution.target` or `kubernetes.cluster-id`) is persisted in the catalog. Suspending or dropping a Materialized Table uses the recorded `execution.target` and cluster id, so they do not need to be set. The session must still be able to reach the cluster, for example through `rest.address` for `remote` or `kubernetes.namespace` for Kubernetes. Resuming a Materialized Table in continuous refresh mode, or altering an activated one, submits a new refresh job to the session's `execution.target` and cluster id, so set them first, as when creating the Materialized Table.
 
 ### Suspend Refresh Job
 
@@ -199,3 +199,67 @@ Flink SQL> ALTER MATERIALIZED TABLE my_materialized_table
 > ... ;
 [INFO] Execute statement succeeded.
 ```
+
+# Table API Programs
+
+A Table API program can create materialized tables in continuous refresh mode without the SQL
+Gateway (see [Table API]({{< ref "docs/sql/materialized-table/table-api" >}})). It submits the
+refresh job to a session cluster, with the execution target `remote`, `yarn-session` or
+`kubernetes-session`. The refresh job runs independently of the program: it keeps running after
+the program ends, and the materialized table can later be suspended, resumed or dropped from any
+other program or from the SQL Gateway. For `remote`, the controlling program must configure the
+cluster's `rest.address`. Restarting the refresh job from a Table API program, by resuming the
+materialized table or by altering or redeploying it while it is activated, compares the program's
+`execution.target` and, for YARN and Kubernetes, its cluster id with the recorded ones, and fails
+if they differ. For `remote` only the target is compared, a program pointed  at another standalone
+cluster resumes a suspended table there. The same applies to the same Kubernetes cluster id in
+another namespace.
+
+## Programs Deployed in Application Mode or Through the Web UI
+
+Set the execution target and cluster id of a session cluster on the program's `TableConfig`, with
+`TableConfig#set`, SQL `SET` or `EnvironmentSettings.Builder#withConfiguration`:
+
+```java
+StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+tEnv.getConfig().set("execution.target", "kubernetes-session");
+tEnv.getConfig().set("kubernetes.cluster-id", "mt-session-cluster");
+```
+
+| Session cluster | Options to set on the `TableConfig` |
+|---|---|
+| Standalone | `execution.target: remote` and `rest.address` |
+| YARN session | `execution.target: yarn-session` and `yarn.application.id` |
+| Kubernetes session | `execution.target: kubernetes-session` and `kubernetes.cluster-id` |
+
+If the `TableConfig` sets `execution.target`, refresh jobs and their control ignore the options of
+the program's own configuration that select a cluster: `rest.address`, `jobmanager.rpc.address`,
+`kubernetes.cluster-id`, `yarn.application.id` and the high-availability settings. All other
+options are read from both configurations, for example `rest.port`, `kubernetes.namespace`, the
+client SSL settings and the program's jars. Set them on the `TableConfig` if the session cluster
+needs different values.
+
+High-availability settings are not needed to reach a session cluster. If you set them on the
+`TableConfig`, set all the ones the cluster needs there. If `execution.target` comes from the
+program's own configuration and that configuration enables high availability with a
+`high-availability.cluster-id`, as `flink run` against a YARN session sets it, a cluster id set on
+the `TableConfig` must name the same cluster.
+
+Application-mode targets such as `kubernetes-application` are rejected for Table API programs,
+whichever configuration sets them.
+Deploying a refresh job in its own application cluster requires the SQL Gateway.
+
+## Session Clusters of the Flink Kubernetes Operator
+
+A `FlinkDeployment` without a job is a
+[session cluster](https://nightlies.apache.org/flink/flink-kubernetes-operator-docs-stable/docs/custom-resource/overview/#session-cluster-deployments).
+The operator deploys it with Flink's native Kubernetes integration, so refresh jobs can use it as
+a `kubernetes-session` target, with `kubernetes.cluster-id` set to the name of the
+`FlinkDeployment` and `kubernetes.namespace` set to its namespace. The program needs permission to
+read services in that namespace. Alternatively, use the `remote` target with `rest.address` set to
+the cluster's REST service, `<name>-rest.<namespace>`.
+
+Refresh jobs submitted this way are not `FlinkSessionJob` resources. The operator does not manage
+them, so they are not part of its upgrade or savepoint handling. Manage them with materialized table
+statements, such as `ALTER MATERIALIZED TABLE ... SUSPEND`, `ALTER MATERIALIZED TABLE ... RESUME`
+and `DROP MATERIALIZED TABLE`.

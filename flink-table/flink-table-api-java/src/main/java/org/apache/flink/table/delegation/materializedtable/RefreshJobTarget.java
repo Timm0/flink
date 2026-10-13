@@ -21,7 +21,11 @@ package org.apache.flink.table.delegation.materializedtable;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.DeploymentOptions;
+import org.apache.flink.table.refresh.ContinuousRefreshHandler;
 
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -32,6 +36,9 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
 @Internal
 public final class RefreshJobTarget {
 
+    public static final String YARN_APPLICATION_ID_KEY = "yarn.application.id";
+    public static final String KUBERNETES_CLUSTER_ID_KEY = "kubernetes.cluster-id";
+
     private final String executionTarget;
     private final String clusterId;
 
@@ -39,6 +46,13 @@ public final class RefreshJobTarget {
         this.executionTarget = checkNotNull(executionTarget);
         this.clusterId = checkNotNull(clusterId);
         checkArgument(!executionTarget.isEmpty(), "The execution target must not be empty.");
+    }
+
+    /** The target a refresh handler records. */
+    public static RefreshJobTarget recordedIn(ContinuousRefreshHandler refreshHandler) {
+        final String clusterId = refreshHandler.getClusterId();
+        return new RefreshJobTarget(
+                refreshHandler.getExecutionTarget(), clusterId == null ? "" : clusterId);
     }
 
     public String getExecutionTarget() {
@@ -53,6 +67,16 @@ public final class RefreshJobTarget {
         return clusterId;
     }
 
+    /** The configuration key that carries this target's cluster id, whether or not it is known. */
+    public Optional<String> getClusterIdKey() {
+        if (executionTarget.startsWith("yarn")) {
+            return Optional.of(YARN_APPLICATION_ID_KEY);
+        } else if (executionTarget.startsWith("kubernetes")) {
+            return Optional.of(KUBERNETES_CLUSTER_ID_KEY);
+        }
+        return Optional.empty();
+    }
+
     /**
      * The configuration key that identifies the cluster, present only when the target has a
      * cluster-id key and the cluster id is known.
@@ -61,11 +85,23 @@ public final class RefreshJobTarget {
         if (clusterId.isEmpty()) {
             return Optional.empty();
         }
-        return MaterializedTableClusterUtils.getClusterIdKey(executionTarget);
+        return getClusterIdKey();
     }
 
+    /** Whether the target deploys each job in its own application cluster. */
     public boolean isApplicationTarget() {
-        return MaterializedTableClusterUtils.isApplicationTarget(executionTarget);
+        return executionTarget.endsWith("application");
+    }
+
+    /**
+     * The target and, under its cluster-id key, the cluster id, as a REFRESH statement reports
+     * them.
+     */
+    public Map<String, String> toClusterInfo() {
+        final Map<String, String> clusterInfo = new HashMap<>();
+        clusterInfo.put(DeploymentOptions.TARGET.key(), executionTarget);
+        getClusterIdKey().ifPresent(key -> clusterInfo.put(key, clusterId));
+        return Collections.unmodifiableMap(clusterInfo);
     }
 
     public void applyTo(Configuration configuration) {

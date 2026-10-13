@@ -48,7 +48,6 @@ import java.util.Optional;
 
 import static org.apache.flink.api.common.RuntimeExecutionMode.STREAMING;
 import static org.apache.flink.configuration.ExecutionOptions.RUNTIME_MODE;
-import static org.apache.flink.table.delegation.materializedtable.MaterializedTableClusterUtils.MINICLUSTER_TARGET;
 
 /**
  * The default implementation of a {@link MaterializedTableJobSubmitter}.
@@ -61,6 +60,7 @@ import static org.apache.flink.table.delegation.materializedtable.MaterializedTa
 public class DefaultMaterializedTableJobSubmitter implements MaterializedTableJobSubmitter {
 
     private static final String DEFAULT_REFRESH_JOB_NAME = "materialized-table-refresh";
+    private static final String MINICLUSTER_TARGET = "minicluster";
 
     private final ExecutableOperation.Context operationCtx;
     private final Planner planner;
@@ -156,20 +156,22 @@ public class DefaultMaterializedTableJobSubmitter implements MaterializedTableJo
                         operationCtx.getResourceManager().getUserClassLoader(),
                         ExecutorFactory.class,
                         ExecutorFactory.DEFAULT_IDENTIFIER);
+        final Configuration executorConfiguration =
+                refreshExecutorConfiguration(
+                        sessionExecutor.getConfiguration(), operationCtx.getTableConfig());
 
         if (MINICLUSTER_TARGET.equals(target.getExecutionTarget())) {
-            return executorFactory.create(
-                    refreshExecutorConfiguration(sessionExecutor.getConfiguration()));
+            return executorFactory.create(executorConfiguration);
         }
 
         return executorFactory.create(
-                refreshExecutorConfiguration(sessionExecutor.getConfiguration()),
-                operationCtx.getResourceManager().getUserClassLoader());
+                executorConfiguration, operationCtx.getResourceManager().getUserClassLoader());
     }
 
-    @VisibleForTesting
-    static Configuration refreshExecutorConfiguration(ReadableConfig programConfiguration) {
-        final Configuration configuration = Configuration.fromMap(programConfiguration.toMap());
+    private static Configuration refreshExecutorConfiguration(
+            ReadableConfig programConfiguration, TableConfig tableConfig) {
+        final Configuration configuration =
+                RefreshJobConfiguration.rootLayer(programConfiguration, tableConfig);
         configuration.removeConfig(PipelineOptionsInternal.PIPELINE_FIXED_JOB_ID);
         configuration.removeConfig(StateRecoveryOptions.SAVEPOINT_PATH);
         return configuration;
