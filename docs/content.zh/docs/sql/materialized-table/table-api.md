@@ -238,3 +238,26 @@ checked for temporary objects, as with `CREATE MATERIALIZED TABLE` in SQL.
 A materialized table created from SQL and later declared from the Table API (or the other way
 round) always registers a change of its query, because the two APIs produce different query
 texts.
+
+## Dropping a materialized table
+
+```java
+boolean dropped = tEnv.dropMaterializedTable("revenue");
+```
+
+`dropMaterializedTable(path, ignoreIfNotExists)` mirrors
+[`DROP MATERIALIZED TABLE`]({{< ref "docs/sql/materialized-table/statements" >}}#drop-materialized-table),
+except that a permanent table or view at the path counts as absent (see below).
+If the continuous refresh job is running, it is cancelled before the materialized table is removed
+from the catalog. A materialized table whose refresh status is `INITIALIZING` cannot be dropped.
+
+`dropMaterializedTable(path)` is `dropMaterializedTable(path, true)`. It returns `true` if a
+materialized table was found at the path and the drop was executed, and `false` if none exists at
+the path. A permanent table or view at the path counts as absent. It is not dropped, and the call
+returns `false`, whereas `DROP MATERIALIZED TABLE IF EXISTS`
+fails in that case. With `ignoreIfNotExists = false`, a missing materialized table, or a table or
+view at its path, fails with a `ValidationException`.
+
+The method only drops permanent objects. If a temporary table or view shadows the materialized
+table, the call fails with a `ValidationException`, also with `ignoreIfNotExists = true`. Drop the
+temporary object first with `dropTemporaryTable` or `dropTemporaryView`.

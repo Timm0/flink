@@ -104,6 +104,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -580,6 +581,79 @@ class MaterializedTableTableApiITCase {
         assertThatThrownBy(() -> tEnv.executeSql("DROP MATERIALIZED TABLE " + MT_NAME))
                 .isInstanceOf(ValidationException.class)
                 .hasMessageContaining("does not exist");
+    }
+
+    @Test
+    void dropMaterializedTableCancelsTheRefreshJob() throws Exception {
+        tEnv.executeSql(continuousMaterializedTableDdl());
+        final JobID refreshJobId = getRefreshJobId();
+        awaitAllVerticesRunning(refreshJobId);
+
+        assertThat(
+                        tEnv.dropMaterializedTable(
+                                "`mt_cat`.`" + DATABASE + "`.`" + MT_NAME + "`", false))
+                .isTrue();
+
+        assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isFalse();
+        awaitJobStatus(refreshJobId, JobStatus.CANCELED);
+        assertThat(tEnv.dropMaterializedTable(MT_NAME)).isFalse();
+    }
+
+    @Test
+    void dropMaterializedTableInInitializingStatusThrowsAndKeepsIt() throws Exception {
+        catalog.createTable(
+                new ObjectPath(DATABASE, MT_NAME),
+                CatalogMaterializedTable.newBuilder()
+                        .schema(Schema.newBuilder().column("k", "INT").build())
+                        .options(Map.of("connector", "values"))
+                        .originalQuery("SELECT k FROM datagen_source")
+                        .expandedQuery("SELECT k FROM datagen_source")
+                        .freshness(IntervalFreshness.ofSecond(30))
+                        .logicalRefreshMode(CatalogMaterializedTable.LogicalRefreshMode.CONTINUOUS)
+                        .refreshMode(RefreshMode.CONTINUOUS)
+                        .refreshStatus(RefreshStatus.INITIALIZING)
+                        .build(),
+                false);
+
+        assertThatThrownBy(() -> tEnv.dropMaterializedTable(MT_NAME))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining("is initializing, skip the drop operation");
+        assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+            strings = {MT_NAME, "no_cat." + DATABASE + "." + MT_NAME, "mt_cat.no_db." + MT_NAME})
+    void dropMaterializedTableOfAMissingPath(String path) {
+        assertThat(tEnv.dropMaterializedTable(path)).isFalse();
+        assertThatThrownBy(() -> tEnv.dropMaterializedTable(path, false))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining("does not exist");
+    }
+
+    @Test
+    void dropMaterializedTableOfARegularTableOrViewKeepsIt() {
+        createRegularTable();
+        tEnv.createView("v", tEnv.from("datagen_source"));
+
+        assertThat(tEnv.dropMaterializedTable(MT_NAME)).isFalse();
+        assertThat(tEnv.dropMaterializedTable("v")).isFalse();
+        assertThatThrownBy(() -> tEnv.dropMaterializedTable(MT_NAME, false))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining("is not a materialized table");
+        assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isTrue();
+        assertThat(catalog.tableExists(new ObjectPath(DATABASE, "v"))).isTrue();
+    }
+
+    @Test
+    void dropMaterializedTableShadowedByATemporaryViewThrowsAndKeepsIt() throws Exception {
+        tEnv.executeSql(continuousMaterializedTableDdl());
+        tEnv.createTemporaryView(MT_NAME, tEnv.from("datagen_source"));
+
+        assertThatThrownBy(() -> tEnv.dropMaterializedTable(MT_NAME))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining("is not a materialized table");
+        assertThat(getMaterializedTable().getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
     }
 
     @Test
