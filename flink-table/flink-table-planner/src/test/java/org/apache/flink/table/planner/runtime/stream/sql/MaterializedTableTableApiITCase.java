@@ -44,6 +44,7 @@ import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.graph.StreamGraph;
 import org.apache.flink.streaming.util.TestStreamEnvironment;
+import org.apache.flink.table.api.CreateMode;
 import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.MaterializedPipeline;
 import org.apache.flink.table.api.MaterializedTable;
@@ -65,6 +66,7 @@ import org.apache.flink.table.catalog.CatalogManager;
 import org.apache.flink.table.catalog.CatalogMaterializedTable;
 import org.apache.flink.table.catalog.CatalogMaterializedTable.RefreshMode;
 import org.apache.flink.table.catalog.CatalogMaterializedTable.RefreshStatus;
+import org.apache.flink.table.catalog.CatalogView;
 import org.apache.flink.table.catalog.GenericInMemoryCatalog;
 import org.apache.flink.table.catalog.IntervalFreshness;
 import org.apache.flink.table.catalog.ObjectIdentifier;
@@ -95,9 +97,12 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.event.Level;
+
+import javax.annotation.Nullable;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -1347,7 +1352,7 @@ class MaterializedTableTableApiITCase {
 
     @Test
     void permanentViewAtThePathIsRejected() throws Exception {
-        tEnv.executeSql("CREATE VIEW " + MT_NAME + " AS SELECT k, v FROM datagen_source");
+        createRegularView();
         final Set<JobID> jobsBefore = listJobIds();
 
         assertThatThrownBy(() -> aggregate().materializeInto(MT_NAME).execute())
@@ -1373,6 +1378,41 @@ class MaterializedTableTableApiITCase {
                 .isInstanceOf(ValidationException.class)
                 .hasMessageContaining("would shadow it");
         assertThat(tableExists()).isFalse();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(TableKind.class)
+    void failIfExistsRejectsAnExistingObjectAndKeepsIt(TableKind existingKind) throws Exception {
+        createObjectAtPath(existingKind);
+        final ObjectPath path = new ObjectPath(DATABASE, MT_NAME);
+        final CatalogBaseTable existing = catalog.getTable(path);
+        final Set<JobID> jobsBefore = listJobIds();
+        final MaterializedPipeline changedDeclaration =
+                tEnv.from("datagen_source")
+                        .select($("k"), $("v"))
+                        .materializeInto(MT_NAME, continuousDescriptor());
+        final String expectedMessage =
+                "Cannot create materialized table mt_cat."
+                        + DATABASE
+                        + "."
+                        + MT_NAME
+                        + ", because a "
+                        + existingKind
+                        + " with the same identifier exists.";
+
+        assertThatThrownBy(() -> changedDeclaration.execute(CreateMode.failIfExists()))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage(expectedMessage);
+        assertThatThrownBy(
+                        () ->
+                                changedDeclaration.execute(
+                                        CreateMode.failIfExists(), StartMode.fromBeginning()))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage(expectedMessage);
+        final CatalogBaseTable current = catalog.getTable(path);
+        assertThat(current.getTableKind()).isEqualTo(existingKind);
+        assertThat(expandedQueryOf(current)).isEqualTo(expandedQueryOf(existing));
+        assertThat(listJobIds()).isEqualTo(jobsBefore);
     }
 
     @ParameterizedTest(name = "{0}")
@@ -1851,12 +1891,45 @@ class MaterializedTableTableApiITCase {
                         + query);
     }
 
+    private static @Nullable String expandedQueryOf(CatalogBaseTable table) {
+        if (table instanceof CatalogMaterializedTable) {
+            return ((CatalogMaterializedTable) table).getExpandedQuery();
+        }
+        if (table instanceof CatalogView) {
+            return ((CatalogView) table).getExpandedQuery();
+        }
+        return null;
+    }
+
+    private void createObjectAtPath(TableKind kind) throws Exception {
+        switch (kind) {
+            case MATERIALIZED_TABLE:
+                aggregate()
+                        .materializeInto(MT_NAME, continuousDescriptor())
+                        .execute(CreateMode.failIfExists());
+                awaitAllVerticesRunning(getRefreshJobId());
+                return;
+            case TABLE:
+                createRegularTable();
+                return;
+            case VIEW:
+                createRegularView();
+                return;
+            default:
+                throw new IllegalArgumentException("Unsupported table kind: " + kind);
+        }
+    }
+
     private void createRegularTable() {
         tEnv.executeSql(
                 "CREATE TABLE "
                         + MT_NAME
                         + " (k INT, cnt BIGINT)"
                         + " WITH ('connector' = 'values', 'sink-insert-only' = 'false')");
+    }
+
+    private void createRegularView() {
+        tEnv.executeSql("CREATE VIEW " + MT_NAME + " AS SELECT k, v FROM datagen_source");
     }
 
     private Table aggregate() {

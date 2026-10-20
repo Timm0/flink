@@ -54,6 +54,8 @@ public interface MaterializedPipeline {
      *
      * <p>Returns once the catalog entry is written and, if a continuous refresh job is started,
      * once that job has been submitted.
+     *
+     * <p>Equivalent to {@code execute(CreateMode.createOrAlter())}.
      */
     MaterializedTable execute();
 
@@ -63,9 +65,29 @@ public interface MaterializedPipeline {
      * records the given start mode instead of the default one. The start mode belongs to this call
      * only, a later {@link #execute()} records the default start mode again.
      *
+     * <p>Equivalent to {@code execute(CreateMode.createOrAlter(), startMode)}.
+     *
      * @throws ValidationException if the start mode is {@code FROM_TIMESTAMP} or {@code
      *     RESUME_OR_FROM_TIMESTAMP} without a timestamp; {@link StartMode#fromTimestamp} and {@link
      *     StartMode#resumeOrFromTimestamp} always set one
      */
     MaterializedTable execute(StartMode startMode);
+
+    /**
+     * Submits this declaration in the given mode and records the default start mode ({@code
+     * materialized-table.default-start-mode}). With {@link CreateMode#failIfExists()}, this has the
+     * semantics of {@code CREATE MATERIALIZED TABLE} without {@code START_MODE}. See {@link
+     * #execute()}.
+     */
+    MaterializedTable execute(CreateMode mode);
+
+    /**
+     * Submits this declaration in the given mode with the given start mode, i.e. with the semantics
+     * of {@code CREATE [OR ALTER] MATERIALIZED TABLE ... START_MODE = ...}. See {@link #execute()}.
+     *
+     * @throws ValidationException if the start mode is {@code FROM_TIMESTAMP} or {@code
+     *     RESUME_OR_FROM_TIMESTAMP} without a timestamp; {@link StartMode#fromTimestamp} and {@link
+     *     StartMode#resumeOrFromTimestamp} always set one
+     */
+    MaterializedTable execute(CreateMode mode, StartMode startMode);
 }

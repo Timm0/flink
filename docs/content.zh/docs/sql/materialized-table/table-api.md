@@ -27,7 +27,9 @@ under the License.
 A Table API program can declare the query of a `Table` as the definition of a materialized table.
 `Table#materializeInto` builds the same declaration as
 [`CREATE OR ALTER MATERIALIZED TABLE ... AS <query>`]({{< ref "docs/sql/materialized-table/statements" >}})
-without `START_MODE`, and `execute()` submits it.
+without `START_MODE`, and `execute()` submits it. `execute(CreateMode.failIfExists())` submits it as
+`CREATE MATERIALIZED TABLE ... AS <query>` instead (see
+[Refusing an existing object](#refusing-an-existing-object)).
 
 ## Requirements
 
@@ -135,7 +137,8 @@ A declared `Schema` behaves like the schema part of the SQL statement:
 
 ## Redeploying
 
-`execute()` is the equivalent of `CREATE OR ALTER MATERIALIZED TABLE`:
+`execute()` uses `CreateMode.createOrAlter()`, the default, which is the equivalent of
+`CREATE OR ALTER MATERIALIZED TABLE`:
 
 - It creates the materialized table if nothing exists at the path.
 - It alters an existing materialized table (see
@@ -188,14 +191,36 @@ watermark keeps the old one. Declaring a physical column first, like a SQL colum
 with a regular column, makes the watermark, the primary key and the computed and virtual metadata
 columns follow the declaration.
 
-`execute()` fails with a `ValidationException` if a regular table or a permanent view exists at
-the path; the Table API does not convert regular tables. It also fails if a temporary table or
-view exists at the path, because that would shadow the materialized table.
+`CreateMode.createOrAlter()` fails with a `ValidationException` if a regular table or a permanent
+view exists at the path. Both create modes also fail if a temporary table or view exists at the
+path, because that would shadow the materialized table.
+
+## Refusing an existing object
+
+`execute(CreateMode.failIfExists())` is the equivalent of `CREATE MATERIALIZED TABLE`. It creates
+the materialized table and refuses to touch anything that already exists at the path. This is
+useful for a first deployment, or for any program where silently altering an existing table would
+be wrong:
+
+```java
+try {
+    tEnv.from("events")
+            .materializeInto("silver")
+            .execute(CreateMode.failIfExists());
+} catch (ValidationException e) {
+    // e.g. an object already exists at the path; it was not changed
+}
+```
+
+`execute(CreateMode.failIfExists())` records `materialized-table.default-start-mode`, like
+`execute()`. `execute(CreateMode.failIfExists(), startMode)` is the equivalent of
+`CREATE MATERIALIZED TABLE ... START_MODE = ...` (see [Start mode](#start-mode)).
 
 ## Start mode
 
 A start mode describes one deployment, not the table, so it is not part of the descriptor. Pass it
-to `execute(StartMode)`. This is the equivalent of `START_MODE = ...` in the SQL statement:
+to `execute(StartMode)`, or with a create mode to `execute(CreateMode, StartMode)`. This is the
+equivalent of `START_MODE = ...` in the SQL statement:
 
 ```java
 tEnv.from("orders").materializeInto("orders_copy").execute(StartMode.fromNow());
@@ -204,12 +229,13 @@ tEnv.from("orders").materializeInto("orders_copy").execute(StartMode.fromNow());
 The `StartMode` factories match the SQL forms, for example `StartMode.fromNow()`,
 `StartMode.fromNow(Duration)`, `StartMode.fromTimestamp(Instant)` and their `resumeOr...`
 counterparts. A `FROM_TIMESTAMP` or `RESUME_OR_FROM_TIMESTAMP` start mode without a timestamp fails
-at `execute(StartMode)` with a `ValidationException`. `execute()` records
+at `execute(StartMode)` and `execute(CreateMode, StartMode)` with a `ValidationException`.
+`execute()` records
 `materialized-table.default-start-mode`, like a statement without `START_MODE`, even if an earlier
 call or a SQL statement declared a different start mode.
 
 The start mode is only recorded in the catalog. The refresh job does not apply it. Every new
-refresh job that `execute()` or `execute(StartMode)` starts, whether the first one or a restart
+refresh job that an `execute(...)` call starts, whether the first one or a restart
 from re-executing a declaration, starts from the sources' own startup options, for example
 `scan.startup.mode`, or the
 [dynamic table options]({{< ref "docs/sql/reference/queries/hints" >}}#dynamic-table-options)
