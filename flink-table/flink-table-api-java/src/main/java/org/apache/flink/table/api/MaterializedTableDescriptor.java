@@ -18,6 +18,7 @@
 
 package org.apache.flink.table.api;
 
+import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigurationUtils;
@@ -303,6 +304,13 @@ public class MaterializedTableDescriptor {
         /** Distributes into the given number of buckets. The algorithm is connector-defined. */
         public Builder distributedInto(int numberOfBuckets) {
             this.distribution = TableDistribution.ofUnknown(numberOfBuckets);
+            return this;
+        }
+
+        /** Sets the given distribution as is. {@code null} clears it. */
+        @Internal
+        public Builder distribution(@Nullable TableDistribution distribution) {
+            this.distribution = distribution;
             return this;
         }
 

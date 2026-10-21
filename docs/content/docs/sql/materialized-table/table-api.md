@@ -288,6 +288,61 @@ for (String name : tEnv.listMaterializedTables("my_catalog", "my_db")) {
 object is not a materialized table. Temporary tables or views at the same path also fail the
 lookup.
 
+## Reading a materialized table
+
+`toTable()` reads the storage of a materialized table, as `tEnv.from(path)` does with its
+identifier. It works on any handle, whether from `execute()` or from
+`fromMaterializedTable(path)`. Use it to query the materialized table, or to declare another
+materialized table on top of it:
+
+```java
+MaterializedTable bronze = tEnv.from("events")
+        .where($("amount").isGreater(0))
+        .materializeInto("bronze")
+        .execute();
+
+MaterializedTable silver = bronze.toTable()
+        .groupBy($("ds"), $("region"))
+        .select($("ds"), $("region"), $("amount").sum().as("revenue"))
+        .materializeInto("silver")
+        .execute();
+
+MaterializedTable gold = silver.toTable()
+        .groupBy($("region"))
+        .select($("region"), $("revenue").sum().as("revenue"))
+        .materializeInto("gold")
+        .execute();
+```
+
+The stored query of each layer reads the layer above it, so `silver` is refreshed from what
+`bronze` has materialized. Using `toQuery()` instead (see [Deriving a definition](#deriving-a-definition))
+would copy the query of `bronze` and define `silver` directly against `events`.
+
+## Deriving a definition
+
+`toQuery()` returns the query that defines a materialized table, and `toDescriptor()` its
+definition as a `MaterializedTableDescriptor`. Together they re-declare a materialized table with a
+modified query:
+
+```java
+silver.toQuery()
+        .where($("revenue").isGreater(0))
+        .materializeInto("silver", silver.toDescriptor())
+        .execute();
+```
+
+If its continuous refresh job is running, this restarts it without state (see
+[Redeploying](#redeploying)).
+
+`toQuery()` plans the stored query text. Every object the query references must be resolvable in
+the current environment under the name it had when the materialized table was declared, including
+the name of its catalog. Otherwise `toQuery()` fails with a `ValidationException`.
+
+`toDescriptor()` describes the same definition as
+[`SHOW CREATE MATERIALIZED TABLE`]({{< ref "docs/sql/reference/utility/show" >}}). Note that
+`toDescriptor()` returns values as stored in the catalog, for example options, normalized refresh
+strategy.
+
 ## Dropping a materialized table
 
 ```java

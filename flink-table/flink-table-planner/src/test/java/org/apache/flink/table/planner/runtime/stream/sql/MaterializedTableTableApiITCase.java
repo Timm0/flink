@@ -1668,16 +1668,7 @@ class MaterializedTableTableApiITCase {
 
     @Test
     void fullDeclarationMatchesTheEquivalentSql() throws Exception {
-        // The primary key needs ds to be NOT NULL in the query.
-        tEnv.executeSql(
-                "CREATE TABLE keyed_source ("
-                        + "k INT NOT NULL, v BIGINT, ts TIMESTAMP(3), ds STRING NOT NULL) WITH (\n"
-                        + "  'connector' = 'datagen',\n"
-                        + "  'rows-per-second' = '5',\n"
-                        + "  'fields.k.min' = '1',\n"
-                        + "  'fields.k.max' = '3',\n"
-                        + "  'fields.ds.length' = '1'\n"
-                        + ")");
+        createKeyedSource();
         tEnv.executeSql(
                 "CREATE MATERIALIZED TABLE sql_mt (\n"
                         + "  k_plus_one AS k + 1,\n"
@@ -1729,6 +1720,77 @@ class MaterializedTableTableApiITCase {
                                             catalog, new ObjectPath(DATABASE, tableName))
                                     .getJobId()));
         }
+    }
+
+    @Test
+    void toTableReadsTheStorageOfALayeredPipeline() throws Exception {
+        final MaterializedTable bronze =
+                aggregate().materializeInto("bronze", continuousDescriptor()).execute();
+
+        bronze.toTable()
+                .groupBy($("k"))
+                .select($("k"), $("cnt").sum().as("total"))
+                .materializeInto("silver", continuousDescriptor())
+                .execute();
+
+        final String silverQuery = getResolvedMaterializedTable("silver").getExpandedQuery();
+        assertThat(silverQuery).contains("`mt_cat`.`" + DATABASE + "`.`bronze`");
+        assertThat(silverQuery).doesNotContain("datagen_source");
+    }
+
+    @Test
+    void toQueryAndToDescriptorRedeclareADerivedDefinition() throws Exception {
+        createKeyedSource();
+        final MaterializedTable materializedTable =
+                tEnv.from("keyed_source")
+                        .groupBy($("k"), $("ds"))
+                        .select($("k"), $("ds"), $("v").sum().as("v"), $("ts").max().as("ts"))
+                        .materializeInto(
+                                MT_NAME,
+                                valuesDescriptor()
+                                        .schema(
+                                                Schema.newBuilder()
+                                                        .columnByExpression("k_plus_one", "k + 1")
+                                                        .watermark("ts", "ts - INTERVAL '5' SECOND")
+                                                        .primaryKey("k", "ds")
+                                                        .build())
+                                        .comment("keyed totals")
+                                        .distributedByHash(2, "k")
+                                        .partitionedBy("ds")
+                                        .continuousRefresh()
+                                        .build())
+                        .execute();
+        awaitAllVerticesRunning(getRefreshJobId());
+
+        final MaterializedTableDescriptor descriptor = materializedTable.toDescriptor();
+        final Schema schema = descriptor.getSchema().orElseThrow();
+        assertThat(schema.getColumns())
+                .extracting(Schema.UnresolvedColumn::getName)
+                .containsExactly("k_plus_one", "k", "ds", "v", "ts");
+        assertThat(schema.getWatermarkSpecs())
+                .extracting(Schema.UnresolvedWatermarkSpec::getColumnName)
+                .containsExactly("ts");
+        assertThat(schema.getPrimaryKey())
+                .hasValueSatisfying(
+                        primaryKey ->
+                                assertThat(primaryKey.getColumnNames()).containsExactly("k", "ds"));
+        assertThat(descriptor.toBuilder().schema(null).build())
+                .isEqualTo(
+                        valuesDescriptor()
+                                .comment("keyed totals")
+                                .distributedByHash(2, "k")
+                                .partitionedBy("ds")
+                                .continuousRefresh()
+                                .build());
+
+        final MaterializedTable redeclared =
+                materializedTable
+                        .toQuery()
+                        .where($("v").isGreater(0))
+                        .materializeInto(MT_NAME, descriptor)
+                        .execute();
+        assertThat(getMaterializedTable().getExpandedQuery()).contains("WHERE");
+        assertThat(redeclared.toDescriptor()).isEqualTo(descriptor);
     }
 
     private StreamTableEnvironment createTableEnvOnSharedCatalog(EnvironmentSettings settings) {
@@ -1911,6 +1973,18 @@ class MaterializedTableTableApiITCase {
                         + "  'rows-per-second' = '5',\n"
                         + "  'fields.k.min' = '1',\n"
                         + "  'fields.k.max' = '3'\n"
+                        + ")");
+    }
+
+    private void createKeyedSource() {
+        tEnv.executeSql(
+                "CREATE TABLE keyed_source ("
+                        + "k INT NOT NULL, v BIGINT, ts TIMESTAMP(3), ds STRING NOT NULL) WITH (\n"
+                        + "  'connector' = 'datagen',\n"
+                        + "  'rows-per-second' = '5',\n"
+                        + "  'fields.k.min' = '1',\n"
+                        + "  'fields.k.max' = '3',\n"
+                        + "  'fields.ds.length' = '1'\n"
                         + ")");
     }
 

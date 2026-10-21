@@ -27,7 +27,8 @@ import org.apache.flink.table.catalog.ObjectIdentifier;
 import java.util.Optional;
 
 /**
- * A handle on an existing materialized table, returned by {@link MaterializedPipeline#execute()}.
+ * A handle on an existing materialized table, returned by {@link MaterializedPipeline#execute()}
+ * and {@link TableEnvironment#fromMaterializedTable(String)}.
  */
 @PublicEvolving
 public interface MaterializedTable {
@@ -67,4 +68,34 @@ public interface MaterializedTable {
      * catalog on every call.
      */
     Optional<String> getRefreshHandlerDescription();
+
+    /**
+     * Reads this table's storage, as {@link TableEnvironment#from(String)} does with {@link
+     * #getIdentifier()}. Use it to query the table or to build downstream tables on it.
+     *
+     * @throws ValidationException if no table exists at {@link #getIdentifier()}
+     */
+    Table toTable();
+
+    /**
+     * The query that defined this table when this handle was created, for deriving a modified
+     * definition, e.g. with {@link Table#materializeInto(String, MaterializedTableDescriptor)}.
+     *
+     * <p>The stored query text is planned when this method is called. Every object it references
+     * must be resolvable in this environment under the name it had when the table was declared,
+     * including the catalog's name.
+     *
+     * @throws ValidationException if the stored query cannot be planned
+     */
+    Table toQuery();
+
+    /**
+     * This table's definition when this handle was created, as a descriptor for re-declaring it,
+     * e.g. with {@link Table#materializeInto(String, MaterializedTableDescriptor)}.
+     *
+     * <p>Reflects the resolved state: the full schema, the options, distribution, partition keys
+     * and comment as stored, the freshness, and the refresh mode in effect as {@link
+     * RefreshStrategy#continuous()} or {@link RefreshStrategy#full()}. It has no start mode.
+     */
+    MaterializedTableDescriptor toDescriptor();
 }

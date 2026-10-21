@@ -20,6 +20,10 @@ package org.apache.flink.table.api.internal.materializedtable;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.table.api.MaterializedTable;
+import org.apache.flink.table.api.MaterializedTableDescriptor;
+import org.apache.flink.table.api.RefreshStrategy;
+import org.apache.flink.table.api.Schema;
+import org.apache.flink.table.api.Table;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.api.internal.TableEnvironmentInternal;
 import org.apache.flink.table.catalog.CatalogBaseTable.TableKind;
@@ -96,6 +100,38 @@ public final class MaterializedTableImpl implements MaterializedTable {
         return lookUpResolvedTable().getRefreshHandlerDescription();
     }
 
+    @Override
+    public Table toTable() {
+        return tableEnvironment.from(getIdentifier().asSerializableString());
+    }
+
+    @Override
+    public Table toQuery() {
+        ResolvedCatalogMaterializedTable resolvedSnapshot = snapshot.getResolvedTable();
+        return tableEnvironment.sqlQuery(resolvedSnapshot.getExpandedQuery());
+    }
+
+    @Override
+    public MaterializedTableDescriptor toDescriptor() {
+        final ResolvedCatalogMaterializedTable table = snapshot.getResolvedTable();
+        final MaterializedTableDescriptor.Builder builder =
+                MaterializedTableDescriptor.newBuilder()
+                        .schema(
+                                Schema.newBuilder()
+                                        .fromResolvedSchema(table.getResolvedSchema())
+                                        .build())
+                        .distribution(table.getDistribution().orElse(null))
+                        .partitionedBy(table.getPartitionKeys().toArray(new String[0]))
+                        .freshness(table.getDefinitionFreshness())
+                        .refreshStrategy(toRefreshStrategy(table.getRefreshMode()));
+        table.getOptions().forEach(builder::option);
+        final String comment = table.getComment();
+        if (comment != null && !comment.isEmpty()) {
+            builder.comment(comment);
+        }
+        return builder.build();
+    }
+
     private ResolvedCatalogMaterializedTable lookUpResolvedTable() {
         return lookUp(tableEnvironment.getCatalogManager(), getIdentifier()).getResolvedTable();
     }
@@ -118,6 +154,18 @@ public final class MaterializedTableImpl implements MaterializedTable {
                             identifier));
         }
         return table;
+    }
+
+    /** Maps the resolved refresh mode, as {@code SHOW CREATE MATERIALIZED TABLE} prints it. */
+    private static RefreshStrategy toRefreshStrategy(RefreshMode refreshMode) {
+        switch (refreshMode) {
+            case CONTINUOUS:
+                return RefreshStrategy.continuous();
+            case FULL:
+                return RefreshStrategy.full();
+            default:
+                throw new IllegalStateException("Unknown refresh mode: " + refreshMode);
+        }
     }
 
     @Override
