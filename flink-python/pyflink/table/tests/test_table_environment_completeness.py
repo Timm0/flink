@@ -46,6 +46,7 @@ class TableEnvironmentAPICompletenessTests(PythonAPICompletenessTestCase, PyFlin
             "fromCall",
             "fromModel",
             "dropMaterializedTable",
+            "fromMaterializedTable",
         }
 
 

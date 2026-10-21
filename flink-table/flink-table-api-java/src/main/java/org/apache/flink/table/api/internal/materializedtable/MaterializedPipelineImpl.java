@@ -106,7 +106,7 @@ public final class MaterializedPipelineImpl implements MaterializedPipeline {
 
     private MaterializedTable submit(CreateMode mode, @Nullable StartMode startMode) {
         tableEnvironment.executeInternal(buildOperation(mode, startMode));
-        return new MaterializedTableImpl(identifier);
+        return MaterializedTableImpl.of(tableEnvironment, identifier);
     }
 
     private Operation buildOperation(CreateMode mode, @Nullable StartMode startMode) {

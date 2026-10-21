@@ -1223,6 +1223,40 @@ class MaterializedTableTableApiITCase {
     }
 
     @Test
+    void fromMaterializedTableSnapshotsTheDefinitionAndReadsTheStatusLive() throws Exception {
+        final MaterializedTable created =
+                aggregate().materializeInto(MT_NAME, Duration.ofSeconds(30)).execute();
+        final MaterializedTable lookedUp =
+                tEnv.fromMaterializedTable("`mt_cat`.`" + DATABASE + "`.`" + MT_NAME + "`");
+
+        final CatalogMaterializedTable stored = getMaterializedTable();
+        assertThat(lookedUp.getIdentifier()).isEqualTo(created.getIdentifier());
+        assertThat(lookedUp.getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
+        assertThat(lookedUp.getRefreshMode()).isEqualTo(RefreshMode.CONTINUOUS);
+        assertThat(lookedUp.getFreshness()).isEqualTo(IntervalFreshness.ofSecond(30));
+        assertThat(lookedUp.getOriginalQuery()).isEqualTo(stored.getOriginalQuery());
+        assertThat(lookedUp.getExpandedQuery()).isEqualTo(stored.getExpandedQuery());
+        assertThat(lookedUp.getRefreshHandlerDescription())
+                .isPresent()
+                .isEqualTo(stored.getRefreshHandlerDescription());
+
+        awaitAllVerticesRunning(getRefreshJobId());
+        tEnv.executeSql(alterAsQueryAddingMaxV());
+
+        assertThat(lookedUp.getOriginalQuery()).isEqualTo(stored.getOriginalQuery());
+        assertThat(lookedUp.getExpandedQuery()).isEqualTo(stored.getExpandedQuery());
+        final CatalogMaterializedTable alteredStored = getMaterializedTable();
+        final MaterializedTable altered =
+                tEnv.fromMaterializedTable("`mt_cat`.`" + DATABASE + "`.`" + MT_NAME + "`");
+        assertThat(lookedUp.getRefreshHandlerDescription())
+                .isEqualTo(alteredStored.getRefreshHandlerDescription())
+                .isNotEqualTo(stored.getRefreshHandlerDescription());
+        assertThat(altered.getOriginalQuery()).isEqualTo(alteredStored.getOriginalQuery());
+        assertThat(altered.getExpandedQuery()).isEqualTo(alteredStored.getExpandedQuery());
+        awaitAllVerticesRunning(getRefreshJobId());
+    }
+
+    @Test
     void executeRecordsTheGivenStartMode() throws Exception {
         final StartMode fromNow = StartMode.fromNow();
 

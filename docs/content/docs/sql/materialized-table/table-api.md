@@ -265,6 +265,29 @@ A materialized table created from SQL and later declared from the Table API (or 
 round) always registers a change of its query, because the two APIs produce different query
 texts.
 
+## Looking up a materialized table
+
+`TableEnvironment#fromMaterializedTable(path)` returns a handle to an existing materialized table,
+for example one declared by another program or in SQL:
+
+```java
+for (String name : tEnv.listMaterializedTables("my_catalog", "my_db")) {
+    String path = ObjectIdentifier.of("my_catalog", "my_db", name).asSerializableString();
+    MaterializedTable mt = tEnv.fromMaterializedTable(path);
+    System.out.printf(
+            "%s: %s, freshness %s, mode %s%n  %s%n",
+            name,
+            mt.getRefreshStatus(),
+            mt.getFreshness(),
+            mt.getRefreshMode(),
+            mt.getOriginalQuery());
+}
+```
+
+`fromMaterializedTable` fails with a `ValidationException` if nothing exists at the path or the
+object is not a materialized table. Temporary tables or views at the same path also fail the
+lookup.
+
 ## Dropping a materialized table
 
 ```java
