@@ -94,8 +94,10 @@ public interface MaterializedTable {
      * e.g. with {@link Table#materializeInto(String, MaterializedTableDescriptor)}.
      *
      * <p>Reflects the resolved state: the full schema, the options, distribution, partition keys
-     * and comment as stored, the freshness, and the refresh mode in effect as {@link
-     * RefreshStrategy#continuous()} or {@link RefreshStrategy#full()}. It has no start mode.
+     * and comment as stored, the freshness, the refresh mode in effect as {@link
+     * RefreshStrategy#continuous()} or {@link RefreshStrategy#full()}, and the recorded start mode.
+     * Re-declaring with this descriptor records that start mode again. Use {@code
+     * MaterializedPipeline#execute(StartMode)} to override it instead.
      */
     MaterializedTableDescriptor toDescriptor();
 }

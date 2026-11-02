@@ -19,6 +19,7 @@
 package org.apache.flink.table.api.internal.materializedtable;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.table.api.CreateMode;
 import org.apache.flink.table.api.MaterializedPipeline;
 import org.apache.flink.table.api.MaterializedTable;
@@ -95,12 +96,6 @@ public final class MaterializedPipelineImpl implements MaterializedPipeline {
     public MaterializedTable execute(CreateMode mode, StartMode startMode) {
         Preconditions.checkNotNull(mode, "Create mode must not be null.");
         Preconditions.checkNotNull(startMode, "Start mode must not be null.");
-        if (StartMode.requiresParameters(startMode.getKind()) && startMode.getTimestamp() == null) {
-            throw new ValidationException(
-                    String.format(
-                            "Start mode %s requires a timestamp. Create it with StartMode.fromTimestamp(Instant) or StartMode.resumeOrFromTimestamp(Instant).",
-                            startMode.getKind()));
-        }
         return submit(mode, startMode);
     }
 
@@ -109,7 +104,23 @@ public final class MaterializedPipelineImpl implements MaterializedPipeline {
         return MaterializedTableImpl.of(tableEnvironment, identifier);
     }
 
-    private Operation buildOperation(CreateMode mode, @Nullable StartMode startMode) {
+    private @Nullable StartMode resolveStartMode(@Nullable StartMode startMode) {
+        final StartMode normalizedStartMode =
+                startMode != null ? startMode : descriptor.getStartMode().orElse(null);
+        if (normalizedStartMode != null
+                && StartMode.requiresParameters(normalizedStartMode.getKind())
+                && normalizedStartMode.getTimestamp() == null) {
+            throw new ValidationException(
+                    String.format(
+                            "Start mode %s requires a timestamp. Create it with StartMode.fromTimestamp(Instant) or StartMode.resumeOrFromTimestamp(Instant).",
+                            normalizedStartMode.getKind()));
+        }
+        return normalizedStartMode;
+    }
+
+    @VisibleForTesting
+    Operation buildOperation(CreateMode mode, @Nullable StartMode startMode) {
+        final StartMode resolvedStartMode = resolveStartMode(startMode);
         final Mode factoryMode = finalizeOperationMode(mode);
         final CatalogManager catalogManager = tableEnvironment.getCatalogManager();
         rejectConflictingObject(factoryMode, catalogManager);
@@ -122,7 +133,7 @@ public final class MaterializedPipelineImpl implements MaterializedPipeline {
                                         descriptor,
                                         queryOperation,
                                         serializedQuery,
-                                        startMode,
+                                        resolvedStartMode,
                                         catalogManager,
                                         operationName(factoryMode)));
     }

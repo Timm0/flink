@@ -26,8 +26,8 @@ under the License.
 
 A Table API program can declare the query of a `Table` as the definition of a materialized table.
 `Table#materializeInto` builds the same declaration as
-[`CREATE OR ALTER MATERIALIZED TABLE ... AS <query>`]({{< ref "docs/sql/materialized-table/statements" >}})
-without `START_MODE`, and `execute()` submits it. `execute(CreateMode.failIfExists())` submits it as
+[`CREATE OR ALTER MATERIALIZED TABLE ... AS <query>`]({{< ref "docs/sql/materialized-table/statements" >}}),
+and `execute()` submits it. `execute(CreateMode.failIfExists())` submits it as
 `CREATE MATERIALIZED TABLE ... AS <query>` instead (see
 [Refusing an existing object](#refusing-an-existing-object)).
 
@@ -74,7 +74,7 @@ MaterializedTable revenue = tEnv.from("orders")
 
 The schema is derived from the query. The engine applies the default freshness
 (`materialized-table.default-freshness.continuous`) and records the default start mode
-(`materialized-table.default-start-mode`) in the catalog (see [Start mode](#start-mode)).
+(`materialized-table.default-start-mode`) in the catalog.
 
 ## Declaring freshness
 
@@ -118,9 +118,11 @@ MaterializedTable enriched = tEnv.from("events")
 The builder methods correspond to the clauses of the SQL statement: `schema(...)` to the column
 list, `comment(...)` to `COMMENT`, `distributedBy...(...)` and `distributedInto(...)` to
 `DISTRIBUTED BY`/`DISTRIBUTED INTO`, `partitionedBy(...)` to `PARTITIONED BY`, `option(...)` to
-`WITH`, `freshness(...)` to `FRESHNESS`, and `continuousRefresh()`/`fullRefresh()` to
-`REFRESH_MODE`. `START_MODE` is passed to `execute(StartMode)` instead (see
-[Start mode](#start-mode)).
+`WITH`, `startMode(...)` to `START_MODE`, `freshness(...)` to `FRESHNESS`, and
+`continuousRefresh()`/`fullRefresh()` to `REFRESH_MODE`.
+
+A start mode passed to `execute(StartMode)` or `execute(CreateMode, StartMode)` overrides the
+descriptor's for that call only.
 
 A declared `Schema` behaves like the schema part of the SQL statement:
 
@@ -179,8 +181,7 @@ A changed freshness, comment or partition keys has no effect on an existing mate
 The declared `WITH` options and distribution replace the stored ones, as in a
 `CREATE OR ALTER MATERIALIZED TABLE` statement: a stored option the declaration omits is reset,
 and a declaration without a distribution drops the stored one. This also applies to a materialized
-table created in SQL. Re-executing also replaces the stored start mode (see
-[Start mode](#start-mode)).
+table created in SQL. Re-executing also replaces the stored start mode.
 
 Without a declared `Schema`, or with one that does not start with a physical column, re-executing
 also keeps parts of the stored schema. The stored watermark stays as it is, even if the
@@ -211,36 +212,6 @@ try {
     // e.g. an object already exists at the path; it was not changed
 }
 ```
-
-`execute(CreateMode.failIfExists())` records `materialized-table.default-start-mode`, like
-`execute()`. `execute(CreateMode.failIfExists(), startMode)` is the equivalent of
-`CREATE MATERIALIZED TABLE ... START_MODE = ...` (see [Start mode](#start-mode)).
-
-## Start mode
-
-A start mode describes one deployment, not the table, so it is not part of the descriptor. Pass it
-to `execute(StartMode)`, or with a create mode to `execute(CreateMode, StartMode)`. This is the
-equivalent of `START_MODE = ...` in the SQL statement:
-
-```java
-tEnv.from("orders").materializeInto("orders_copy").execute(StartMode.fromNow());
-```
-
-The `StartMode` factories match the SQL forms, for example `StartMode.fromNow()`,
-`StartMode.fromNow(Duration)`, `StartMode.fromTimestamp(Instant)` and their `resumeOr...`
-counterparts. A `FROM_TIMESTAMP` or `RESUME_OR_FROM_TIMESTAMP` start mode without a timestamp fails
-at `execute(StartMode)` and `execute(CreateMode, StartMode)` with a `ValidationException`.
-`execute()` records
-`materialized-table.default-start-mode`, like a statement without `START_MODE`, even if an earlier
-call or a SQL statement declared a different start mode.
-
-The start mode is only recorded in the catalog. The refresh job does not apply it. Every new
-refresh job that an `execute(...)` call starts, whether the first one or a restart
-from re-executing a declaration, starts from the sources' own startup options, for example
-`scan.startup.mode`, or the
-[dynamic table options]({{< ref "docs/sql/reference/queries/hints" >}}#dynamic-table-options)
-specified in the query. Only the rollback restart described under [Redeploying](#redeploying)
-restores a savepoint.
 
 ## The stored query
 

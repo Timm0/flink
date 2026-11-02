@@ -1257,35 +1257,6 @@ class MaterializedTableTableApiITCase {
     }
 
     @Test
-    void executeRecordsTheGivenStartMode() throws Exception {
-        final StartMode fromNow = StartMode.fromNow();
-
-        final MaterializedTable materializedTable =
-                aggregate().materializeInto(MT_NAME, continuousDescriptor()).execute(fromNow);
-
-        assertThat(materializedTable.getIdentifier())
-                .isEqualTo(ObjectIdentifier.of("mt_cat", DATABASE, MT_NAME));
-        final CatalogMaterializedTable table = getMaterializedTable();
-        assertThat(table.getRefreshMode()).isEqualTo(RefreshMode.CONTINUOUS);
-        assertThat(table.getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
-        assertThat(table.getStartMode()).contains(fromNow);
-        awaitAllVerticesRunning(getRefreshJobId());
-    }
-
-    @Test
-    void executeRejectsAStartModeWithoutItsRequiredTimestamp() {
-        final MaterializedPipeline pipeline =
-                aggregate().materializeInto(MT_NAME, continuousDescriptor());
-        final StartMode withoutTimestamp = StartMode.of(StartMode.StartModeKind.FROM_TIMESTAMP);
-
-        assertThatThrownBy(() -> pipeline.execute(withoutTimestamp))
-                .isInstanceOf(ValidationException.class)
-                .hasMessage(
-                        "Start mode FROM_TIMESTAMP requires a timestamp. Create it with StartMode.fromTimestamp(Instant) or StartMode.resumeOrFromTimestamp(Instant).");
-        assertThat(tableExists()).isFalse();
-    }
-
-    @Test
     void invalidPathFailsAtMaterializeInto() {
         assertThatThrownBy(() -> aggregate().materializeInto("a.b.c.d"))
                 .isInstanceOf(SqlParserException.class)
@@ -1342,7 +1313,7 @@ class MaterializedTableTableApiITCase {
 
     @Test
     void reExecutingAChangedDeclarationAppendsANullableColumn() throws Exception {
-        aggregate().materializeInto(MT_NAME, Duration.ofSeconds(30)).execute();
+        aggregate().materializeInto(MT_NAME, Duration.ofSeconds(30)).execute(StartMode.fromNow());
         final JobID firstJobId = getRefreshJobId();
         awaitAllVerticesRunning(firstJobId);
 
@@ -1359,6 +1330,7 @@ class MaterializedTableTableApiITCase {
         assertThat(storedSchema.getColumnNames()).containsExactly("k", "cnt", "rows");
         assertThat(storedSchema.getColumnDataTypes().get(2).getLogicalType())
                 .isEqualTo(new BigIntType(true));
+        assertThat(getMaterializedTable().getStartMode()).contains(StartMode.fromBeginning());
         final JobID secondJobId = getRefreshJobId();
         assertThat(secondJobId).isNotEqualTo(firstJobId);
         assertThat(getRefreshHandler().getRestorePath()).isEmpty();
@@ -1679,6 +1651,7 @@ class MaterializedTableTableApiITCase {
                         + "DISTRIBUTED BY HASH(k) INTO 2 BUCKETS\n"
                         + "PARTITIONED BY (ds)\n"
                         + "WITH ('connector' = 'values', 'sink-insert-only' = 'false')\n"
+                        + "START_MODE = RESUME_OR_FROM_NOW\n"
                         + "FRESHNESS = INTERVAL '30' SECOND\n"
                         + "REFRESH_MODE = CONTINUOUS\n"
                         + "AS SELECT k, ds, SUM(v) AS v, MAX(ts) AS ts FROM keyed_source GROUP BY k, ds");
@@ -1698,6 +1671,7 @@ class MaterializedTableTableApiITCase {
                                 .comment("keyed totals")
                                 .distributedByHash(2, "k")
                                 .partitionedBy("ds")
+                                .startMode(StartMode.resumeOrFromNow())
                                 .continuousRefresh()
                                 .build())
                 .execute();
@@ -1757,6 +1731,7 @@ class MaterializedTableTableApiITCase {
                                         .comment("keyed totals")
                                         .distributedByHash(2, "k")
                                         .partitionedBy("ds")
+                                        .startMode(StartMode.fromNow())
                                         .continuousRefresh()
                                         .build())
                         .execute();
@@ -1780,6 +1755,7 @@ class MaterializedTableTableApiITCase {
                                 .comment("keyed totals")
                                 .distributedByHash(2, "k")
                                 .partitionedBy("ds")
+                                .startMode(StartMode.fromNow())
                                 .continuousRefresh()
                                 .build());
 

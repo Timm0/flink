@@ -23,6 +23,7 @@ import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigurationUtils;
 import org.apache.flink.table.catalog.IntervalFreshness;
+import org.apache.flink.table.catalog.StartMode;
 import org.apache.flink.table.catalog.TableDistribution;
 import org.apache.flink.table.utils.EncodingUtils;
 import org.apache.flink.util.Preconditions;
@@ -71,6 +72,7 @@ public class MaterializedTableDescriptor {
     private final @Nullable String comment;
     private final @Nullable IntervalFreshness freshness;
     private final RefreshStrategy refreshStrategy;
+    private final @Nullable StartMode startMode;
 
     protected MaterializedTableDescriptor(MaterializedTableDescriptor descriptor) {
         this.schema = descriptor.schema;
@@ -80,6 +82,7 @@ public class MaterializedTableDescriptor {
         this.comment = descriptor.comment;
         this.freshness = descriptor.freshness;
         this.refreshStrategy = descriptor.refreshStrategy;
+        this.startMode = descriptor.startMode;
     }
 
     private MaterializedTableDescriptor(Builder builder) {
@@ -90,6 +93,7 @@ public class MaterializedTableDescriptor {
         this.comment = builder.comment;
         this.freshness = builder.freshness;
         this.refreshStrategy = builder.refreshStrategy;
+        this.startMode = builder.startMode;
     }
 
     /** Creates a builder for a declaration that uses all defaults. */
@@ -131,6 +135,14 @@ public class MaterializedTableDescriptor {
         return refreshStrategy;
     }
 
+    /**
+     * The declared start mode. If not set, {@code materialized-table.default-start-mode} is
+     * recorded.
+     */
+    public Optional<StartMode> getStartMode() {
+        return Optional.ofNullable(startMode);
+    }
+
     @Override
     public String toString() {
         final List<String> clauses = new ArrayList<>();
@@ -166,6 +178,9 @@ public class MaterializedTableDescriptor {
                                             String.format("WITH (%n"),
                                             String.format("%n)"))));
         }
+        if (startMode != null) {
+            clauses.add("START_MODE = " + startMode.asSummaryString());
+        }
         if (freshness != null) {
             clauses.add("FRESHNESS = " + freshness);
         }
@@ -190,13 +205,21 @@ public class MaterializedTableDescriptor {
                 && partitionKeys.equals(that.partitionKeys)
                 && Objects.equals(comment, that.comment)
                 && Objects.equals(freshness, that.freshness)
-                && refreshStrategy.equals(that.refreshStrategy);
+                && refreshStrategy.equals(that.refreshStrategy)
+                && Objects.equals(startMode, that.startMode);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(
-                schema, options, distribution, partitionKeys, comment, freshness, refreshStrategy);
+                schema,
+                options,
+                distribution,
+                partitionKeys,
+                comment,
+                freshness,
+                refreshStrategy,
+                startMode);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -212,6 +235,7 @@ public class MaterializedTableDescriptor {
         private @Nullable String comment;
         private @Nullable IntervalFreshness freshness;
         private RefreshStrategy refreshStrategy = RefreshStrategy.automatic();
+        private @Nullable StartMode startMode;
 
         protected Builder() {
             this.options = new LinkedHashMap<>();
@@ -226,6 +250,7 @@ public class MaterializedTableDescriptor {
             this.comment = descriptor.comment;
             this.freshness = descriptor.freshness;
             this.refreshStrategy = descriptor.refreshStrategy;
+            this.startMode = descriptor.startMode;
         }
 
         /**
@@ -371,6 +396,16 @@ public class MaterializedTableDescriptor {
                                 Integer.MAX_VALUE, freshness));
             }
             return freshness(IntervalFreshness.fromDuration(freshness));
+        }
+
+        /**
+         * Declares the start mode that a declaration records in the catalog. Equivalent to {@code
+         * START_MODE = ...}. {@link MaterializedPipeline#execute(StartMode)} overrides it for one
+         * call.
+         */
+        public Builder startMode(@Nullable StartMode startMode) {
+            this.startMode = startMode;
+            return this;
         }
 
         /** Declares the refresh strategy. Defaults to {@link RefreshStrategy#automatic()}. */

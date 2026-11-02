@@ -123,7 +123,8 @@ public final class MaterializedTableImpl implements MaterializedTable {
                         .distribution(table.getDistribution().orElse(null))
                         .partitionedBy(table.getPartitionKeys().toArray(new String[0]))
                         .freshness(table.getDefinitionFreshness())
-                        .refreshStrategy(toRefreshStrategy(table.getRefreshMode()));
+                        .refreshStrategy(toRefreshStrategy(table.getRefreshMode()))
+                        .startMode(table.getStartMode().orElse(null));
         table.getOptions().forEach(builder::option);
         final String comment = table.getComment();
         if (comment != null && !comment.isEmpty()) {

@@ -21,6 +21,7 @@ package org.apache.flink.table.api;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigOptions;
 import org.apache.flink.table.catalog.IntervalFreshness;
+import org.apache.flink.table.catalog.StartMode;
 import org.apache.flink.table.catalog.TableDistribution;
 
 import org.junit.jupiter.api.Test;
@@ -56,6 +57,7 @@ class MaterializedTableDescriptorTest {
         assertThat(descriptor.getComment()).isEmpty();
         assertThat(descriptor.getFreshness()).isEmpty();
         assertThat(descriptor.getRefreshStrategy()).isEqualTo(RefreshStrategy.automatic());
+        assertThat(descriptor.getStartMode()).isEmpty();
     }
 
     @Test
@@ -71,6 +73,7 @@ class MaterializedTableDescriptorTest {
         assertThat(descriptor.getComment()).contains("my mt");
         assertThat(descriptor.getFreshness()).contains(IntervalFreshness.ofMinute(1));
         assertThat(descriptor.getRefreshStrategy()).isEqualTo(RefreshStrategy.continuous());
+        assertThat(descriptor.getStartMode()).contains(StartMode.fromNow());
 
         assertThat(
                         MaterializedTableDescriptor.newBuilder()
@@ -109,11 +112,13 @@ class MaterializedTableDescriptorTest {
                         .schema(null)
                         .comment(null)
                         .freshness((IntervalFreshness) null)
+                        .startMode(null)
                         .build();
 
         assertThat(cleared.getSchema()).isEmpty();
         assertThat(cleared.getComment()).isEmpty();
         assertThat(cleared.getFreshness()).isEmpty();
+        assertThat(cleared.getStartMode()).isEmpty();
     }
 
     @Test
@@ -133,6 +138,8 @@ class MaterializedTableDescriptorTest {
         assertThat(descriptor.toBuilder().build()).isEqualTo(descriptor);
         assertThat(descriptor.toBuilder().build()).hasSameHashCodeAs(descriptor);
         assertThat(descriptor.toBuilder().comment("changed").build()).isNotEqualTo(descriptor);
+        assertThat(descriptor.toBuilder().startMode(StartMode.fromBeginning()).build())
+                .isNotEqualTo(descriptor);
     }
 
     @Test
@@ -199,7 +206,7 @@ class MaterializedTableDescriptorTest {
                 .contains("'connector' = 'values'")
                 .contains("FRESHNESS = INTERVAL '1' MINUTE")
                 .contains("REFRESH_MODE = CONTINUOUS")
-                .doesNotContain("START_MODE");
+                .contains("START_MODE = FROM_NOW");
 
         List<Integer> clauseIndexes =
                 List.of(
@@ -208,12 +215,10 @@ class MaterializedTableDescriptorTest {
                         rendered.indexOf("DISTRIBUTED BY"),
                         rendered.indexOf("PARTITIONED BY"),
                         rendered.indexOf("WITH ("),
+                        rendered.indexOf("START_MODE"),
                         rendered.indexOf("FRESHNESS"),
                         rendered.indexOf("REFRESH_MODE"));
         assertThat(clauseIndexes).isSorted().doesNotHaveDuplicates();
-
-        assertThat(MaterializedTableDescriptor.newBuilder().build().toString())
-                .doesNotContain("REFRESH_MODE");
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -227,6 +232,7 @@ class MaterializedTableDescriptorTest {
                 .partitionedBy("k")
                 .comment("my mt")
                 .freshness(IntervalFreshness.ofMinute(1))
+                .startMode(StartMode.fromNow())
                 .continuousRefresh()
                 .build();
     }

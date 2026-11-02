@@ -37,11 +37,9 @@ public interface MaterializedPipeline {
     ObjectIdentifier getIdentifier();
 
     /**
-     * Submits this declaration with the semantics of {@code CREATE OR ALTER MATERIALIZED TABLE}
-     * without {@code START_MODE}: creates the materialized table, or alters an existing one, and
-     * records the default start mode ({@code materialized-table.default-start-mode}). A changed
-     * freshness, comment or partition keys has no effect on an existing materialized table. Fails
-     * if a regular table, a view, or a temporary table or view exists at the path.
+     * Submits this declaration with the semantics of {@code CREATE OR ALTER MATERIALIZED TABLE}:
+     * creates the materialized table, or alters an existing one. Fails if a regular table, a view,
+     * or a temporary table or view exists at the path.
      *
      * <p>If the materialized table exists and its continuous refresh job is running, the job is
      * stopped with a savepoint and a new refresh job is started, which does not restore that
@@ -56,14 +54,16 @@ public interface MaterializedPipeline {
      * once that job has been submitted.
      *
      * <p>Equivalent to {@code execute(CreateMode.createOrAlter())}.
+     *
+     * @throws ValidationException if the descriptor's start mode is {@code FROM_TIMESTAMP} or
+     *     {@code RESUME_OR_FROM_TIMESTAMP} without a timestamp.
      */
     MaterializedTable execute();
 
     /**
      * Submits this declaration with the given start mode, i.e. with the semantics of {@code CREATE
-     * OR ALTER MATERIALIZED TABLE ... START_MODE = ...}. It behaves like {@link #execute()}, but
-     * records the given start mode instead of the default one. The start mode belongs to this call
-     * only, a later {@link #execute()} records the default start mode again.
+     * OR ALTER MATERIALIZED TABLE ... START_MODE = ...}. It behaves like {@link #execute()}. The
+     * start mode belongs to this call only and overrides the descriptor's.
      *
      * <p>Equivalent to {@code execute(CreateMode.createOrAlter(), startMode)}.
      *
@@ -74,16 +74,18 @@ public interface MaterializedPipeline {
     MaterializedTable execute(StartMode startMode);
 
     /**
-     * Submits this declaration in the given mode and records the default start mode ({@code
-     * materialized-table.default-start-mode}). With {@link CreateMode#failIfExists()}, this has the
-     * semantics of {@code CREATE MATERIALIZED TABLE} without {@code START_MODE}. See {@link
-     * #execute()}.
+     * Submits this declaration in the given mode. With {@link CreateMode#failIfExists()}, this has
+     * the semantics of {@code CREATE MATERIALIZED TABLE}. See {@link #execute()}.
+     *
+     * @throws ValidationException if the descriptor's start mode is {@code FROM_TIMESTAMP} or
+     *     {@code RESUME_OR_FROM_TIMESTAMP} without a timestamp.
      */
     MaterializedTable execute(CreateMode mode);
 
     /**
-     * Submits this declaration in the given mode with the given start mode, i.e. with the semantics
-     * of {@code CREATE [OR ALTER] MATERIALIZED TABLE ... START_MODE = ...}. See {@link #execute()}.
+     * Submits this declaration in the given mode with the given start mode, which overrides the
+     * descriptor's, i.e. with the semantics of {@code CREATE [OR ALTER] MATERIALIZED TABLE ...
+     * START_MODE = ...}. See {@link #execute()}.
      *
      * @throws ValidationException if the start mode is {@code FROM_TIMESTAMP} or {@code
      *     RESUME_OR_FROM_TIMESTAMP} without a timestamp; {@link StartMode#fromTimestamp} and {@link
