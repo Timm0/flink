@@ -19,6 +19,8 @@
 package org.apache.flink.table.api.internal.materializedtable;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.table.api.ExplainDetail;
+import org.apache.flink.table.api.ExplainFormat;
 import org.apache.flink.table.api.MaterializedTable;
 import org.apache.flink.table.api.MaterializedTableDescriptor;
 import org.apache.flink.table.api.RefreshStrategy;
@@ -34,7 +36,9 @@ import org.apache.flink.table.catalog.ContextResolvedTable;
 import org.apache.flink.table.catalog.IntervalFreshness;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.catalog.ResolvedCatalogMaterializedTable;
+import org.apache.flink.table.operations.SinkModifyOperation;
 
+import java.util.List;
 import java.util.Optional;
 
 /** Implementation of {@link MaterializedTable}. */
@@ -131,6 +135,13 @@ public final class MaterializedTableImpl implements MaterializedTable {
             builder.comment(comment);
         }
         return builder.build();
+    }
+
+    @Override
+    public String explain(ExplainFormat format, ExplainDetail... extraDetails) {
+        final SinkModifyOperation refreshPipeline =
+                new SinkModifyOperation(snapshot.toCatalogTable(), toQuery().getQueryOperation());
+        return tableEnvironment.explainInternal(List.of(refreshPipeline), format, extraDetails);
     }
 
     private ResolvedCatalogMaterializedTable lookUpResolvedTable() {

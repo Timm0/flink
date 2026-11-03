@@ -259,6 +259,24 @@ for (String name : tEnv.listMaterializedTables("my_catalog", "my_db")) {
 object is not a materialized table. Temporary tables or views at the same path also fail the
 lookup.
 
+## Explaining a materialized table
+
+```java
+tEnv.from("orders")
+        .groupBy($("ds"), $("region"))
+        .select($("ds"), $("region"), $("amount").sum().as("revenue"))
+        .materializeInto("revenue")
+        .printExplain();
+
+tEnv.fromMaterializedTable("revenue").printExplain();
+```
+
+`MaterializedPipeline#explain()` shows the plan of what `execute()` would run, as
+`EXPLAIN CREATE OR ALTER MATERIALIZED TABLE` does.
+
+`MaterializedTable#explain()` shows the plan of an `INSERT INTO` the materialized table with its
+query, as defined when the handle was created.
+
 ## Reading a materialized table
 
 `toTable()` reads the storage of a materialized table, as `tEnv.from(path)` does with its

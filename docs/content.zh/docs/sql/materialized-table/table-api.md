@@ -205,12 +205,12 @@ be wrong:
 
 ```java
 try {
-    tEnv.from("events")
+        tEnv.from("events")
             .materializeInto("silver")
             .execute(CreateMode.failIfExists());
-} catch (ValidationException e) {
-    // e.g. an object already exists at the path; it was not changed
-}
+        } catch (ValidationException e) {
+        // e.g. an object already exists at the path; it was not changed
+        }
 ```
 
 ## The stored query
@@ -243,8 +243,8 @@ for example one declared by another program or in SQL:
 
 ```java
 for (String name : tEnv.listMaterializedTables("my_catalog", "my_db")) {
-    String path = ObjectIdentifier.of("my_catalog", "my_db", name).asSerializableString();
-    MaterializedTable mt = tEnv.fromMaterializedTable(path);
+String path = ObjectIdentifier.of("my_catalog", "my_db", name).asSerializableString();
+MaterializedTable mt = tEnv.fromMaterializedTable(path);
     System.out.printf(
             "%s: %s, freshness %s, mode %s%n  %s%n",
             name,
@@ -252,12 +252,30 @@ for (String name : tEnv.listMaterializedTables("my_catalog", "my_db")) {
             mt.getFreshness(),
             mt.getRefreshMode(),
             mt.getOriginalQuery());
-}
+        }
 ```
 
 `fromMaterializedTable` fails with a `ValidationException` if nothing exists at the path or the
 object is not a materialized table. Temporary tables or views at the same path also fail the
 lookup.
+
+## Explaining a materialized table
+
+```java
+tEnv.from("orders")
+        .groupBy($("ds"), $("region"))
+        .select($("ds"), $("region"), $("amount").sum().as("revenue"))
+        .materializeInto("revenue")
+        .printExplain();
+
+tEnv.fromMaterializedTable("revenue").printExplain();
+```
+
+`MaterializedPipeline#explain()` shows the plan of what `execute()` would run, as
+`EXPLAIN CREATE OR ALTER MATERIALIZED TABLE` does.
+
+`MaterializedTable#explain()` shows the plan of an `INSERT INTO` the materialized table with its
+query, as defined when the handle was created.
 
 ## Reading a materialized table
 

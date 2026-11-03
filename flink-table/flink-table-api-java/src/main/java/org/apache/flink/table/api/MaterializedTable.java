@@ -31,7 +31,7 @@ import java.util.Optional;
  * and {@link TableEnvironment#fromMaterializedTable(String)}.
  */
 @PublicEvolving
-public interface MaterializedTable {
+public interface MaterializedTable extends Explainable<MaterializedTable> {
 
     /** The fully qualified identifier of the materialized table. */
     ObjectIdentifier getIdentifier();
