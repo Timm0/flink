@@ -24,6 +24,7 @@ import org.apache.flink.table.catalog.CatalogMaterializedTable.RefreshStatus;
 import org.apache.flink.table.catalog.IntervalFreshness;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -100,4 +101,79 @@ public interface MaterializedTable extends Explainable<MaterializedTable> {
      * MaterializedPipeline#execute(StartMode)} to override it instead.
      */
     MaterializedTableDescriptor toDescriptor();
+
+    /**
+     * Stops the continuous refresh job with a savepoint and records the materialized table as
+     * SUSPENDED. Equivalent to {@code ALTER MATERIALIZED TABLE ... SUSPEND}.
+     *
+     * <p>Stopping with a savepoint needs {@code execution.checkpointing.savepoint-dir}. {@link
+     * #resume()} restores the savepoint.
+     *
+     * @throws TableException if the table is already suspended or INITIALIZING, if it is in full
+     *     refresh mode, or if the refresh job cannot be stopped with a savepoint, for example
+     *     because {@code execution.checkpointing.savepoint-dir} is not set
+     * @throws ValidationException if no materialized table exists at {@link #getIdentifier()} or a
+     *     temporary table or view shadows it
+     */
+    void suspend();
+
+    /**
+     * Equivalent to {@code resume(Collections.emptyMap())} and to {@code ALTER MATERIALIZED TABLE
+     * ... RESUME}.
+     */
+    void resume();
+
+    /**
+     * Starts a new continuous refresh job and records the materialized table as ACTIVATED.
+     * Equivalent to {@code ALTER MATERIALIZED TABLE ... RESUME WITH (...)}.
+     *
+     * <p>The refresh job restores the savepoint taken by {@link #suspend()}. If the table was
+     * altered or redeployed while suspended, there is no savepoint, and the job starts without
+     * state. On an ACTIVATED table whose refresh job has already ended and is still known to the
+     * cluster, a new refresh job starts without state. If {@code execution.state-recovery.path} is
+     * set on the {@link TableConfig}, a refresh job that would start without state restores that
+     * savepoint instead.
+     *
+     * <p>The dynamic options apply to this refresh job only, as dynamic table options of the
+     * materialized table.
+     *
+     * <p>Returns once the refresh job has been submitted and the table is recorded as ACTIVATED,
+     * not when the job is running.
+     *
+     * @param dynamicOptions options for this refresh job, as in {@code RESUME WITH (...)}
+     * @throws TableException if the table is INITIALIZING, its refresh job is still running or its
+     *     status cannot be retrieved, it is in full refresh mode, or the refresh job cannot be
+     *     started. The table then keeps its refresh status.
+     * @throws ValidationException if no materialized table exists at {@link #getIdentifier()} or a
+     *     temporary table or view shadows it, if its refresh job runs in its own application
+     *     cluster, or if this program's {@code execution.target} or cluster id differs from the
+     *     recorded one
+     */
+    void resume(Map<String, String> dynamicOptions);
+
+    /**
+     * Drops this materialized table, as {@link TableEnvironment#dropMaterializedTable(String)} does
+     * with {@link #getIdentifier()}. Equivalent to {@code drop(true)}.
+     *
+     * @return true if a materialized table was found and the drop was executed, false if no
+     *     materialized table exists at the identifier
+     * @throws ValidationException if a temporary table or view shadows the materialized table
+     */
+    boolean drop();
+
+    /**
+     * Drops this materialized table, as {@link TableEnvironment#dropMaterializedTable(String,
+     * boolean)} does with {@link #getIdentifier()}. Like {@code DROP MATERIALIZED TABLE [IF
+     * EXISTS]}.
+     *
+     * <p>A running continuous refresh job is cancelled before the table is removed from the
+     * catalog.
+     *
+     * @param ignoreIfNotExists if false, an exception is thrown if no materialized table exists at
+     *     the identifier, including when a permanent table or view exists there instead
+     * @return true if a materialized table was found and the drop was executed, false if none
+     *     exists and ignoreIfNotExists is true
+     * @throws ValidationException if a temporary table or view shadows the materialized table
+     */
+    boolean drop(boolean ignoreIfNotExists);
 }

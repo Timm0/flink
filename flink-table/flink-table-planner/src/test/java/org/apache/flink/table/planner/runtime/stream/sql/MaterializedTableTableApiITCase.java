@@ -221,24 +221,38 @@ class MaterializedTableTableApiITCase {
         assertThat(materializedTable.getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
 
         JobID refreshJobId = getRefreshJobId();
-        tEnv.executeSql("DROP MATERIALIZED TABLE " + MT_NAME);
+        final MaterializedTable handle = tEnv.fromMaterializedTable(MT_NAME);
+        tEnv.useCatalog("default_catalog");
+        assertThat(handle.drop(false)).isTrue();
 
         assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isFalse();
         awaitJobStatus(refreshJobId, JobStatus.CANCELED);
+        assertThat(handle.drop()).isFalse();
+        assertThatThrownBy(() -> handle.drop(false))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining("does not exist");
     }
 
     @Test
     void suspendAndResumeContinuous() throws Exception {
         tEnv.executeSql(continuousMaterializedTableDdl());
-        assertThat(getMaterializedTable().getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
+        final MaterializedTable materializedTable = tEnv.fromMaterializedTable(MT_NAME);
+        assertThat(materializedTable.getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
 
         awaitAllVerticesRunning(getRefreshJobId());
 
-        tEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " SUSPEND");
-        assertThat(getMaterializedTable().getRefreshStatus()).isEqualTo(RefreshStatus.SUSPENDED);
+        materializedTable.suspend();
+        assertThat(materializedTable.getRefreshStatus()).isEqualTo(RefreshStatus.SUSPENDED);
 
-        tEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " RESUME");
-        assertThat(getMaterializedTable().getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
+        // an insert-only sink rejects the updating query, which proves the options are forwarded
+        assertThatThrownBy(() -> materializedTable.resume(Map.of("sink-insert-only", "true")))
+                .isInstanceOf(TableException.class)
+                .rootCause()
+                .hasMessageContaining("doesn't support consuming update");
+        assertThat(materializedTable.getRefreshStatus()).isEqualTo(RefreshStatus.SUSPENDED);
+
+        materializedTable.resume();
+        assertThat(materializedTable.getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
         awaitAllVerticesRunning(getRefreshJobId());
     }
 
@@ -332,8 +346,10 @@ class MaterializedTableTableApiITCase {
         final JobID refreshJobId = getRefreshJobId();
         awaitAllVerticesRunning(refreshJobId);
 
-        createTableEnvOnSharedCatalogWithAnUnreachableClusterInTheRoot()
-                .executeSql("DROP MATERIALIZED TABLE " + MT_NAME);
+        assertThat(
+                        createTableEnvOnSharedCatalogWithAnUnreachableClusterInTheRoot()
+                                .dropMaterializedTable(MT_NAME))
+                .isTrue();
 
         assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isFalse();
         awaitJobStatus(refreshJobId, JobStatus.CANCELED);
@@ -465,8 +481,8 @@ class MaterializedTableTableApiITCase {
         assertThat(convertedTable.getTableKind()).isEqualTo(TableKind.MATERIALIZED_TABLE);
         assertThat(convertedTable.getRefreshStatus()).isEqualTo(RefreshStatus.SUSPENDED);
 
-        assertThatThrownBy(
-                        () -> tEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " SUSPEND"))
+        final MaterializedTable handle = tEnv.fromMaterializedTable(MT_NAME);
+        assertThatThrownBy(handle::suspend)
                 .isInstanceOf(TableException.class)
                 .hasMessageEndingWith("continuous refresh job has been suspended.");
 
@@ -476,7 +492,7 @@ class MaterializedTableTableApiITCase {
         assertThat(alteredTable.getRefreshStatus()).isEqualTo(RefreshStatus.SUSPENDED);
         assertThat(alteredTable.getExpandedQuery()).contains("max_v");
 
-        tEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " RESUME");
+        handle.resume();
         assertThat(getMaterializedTable().getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
         awaitAllVerticesRunning(getRefreshJobId());
     }
@@ -507,12 +523,13 @@ class MaterializedTableTableApiITCase {
         tEnv.executeSql(continuousMaterializedTableDdl());
         JobID refreshJobId = getRefreshJobId();
         awaitAllVerticesRunning(refreshJobId);
-        tEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " SUSPEND");
+        final MaterializedTable handle = tEnv.fromMaterializedTable(MT_NAME);
+        handle.suspend();
         ContinuousRefreshHandler suspendedHandler = getRefreshHandler();
 
         tEnv.getConfig().set(DeploymentOptions.TARGET, "kubernetes-session");
 
-        assertThatThrownBy(() -> tEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " RESUME"))
+        assertThatThrownBy(() -> handle.resume())
                 .isInstanceOf(ValidationException.class)
                 .hasMessageContaining("'kubernetes.cluster-id'");
 
@@ -560,7 +577,7 @@ class MaterializedTableTableApiITCase {
         clusterClient.cancel(cancelledJobId).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         awaitJobStatus(cancelledJobId, JobStatus.CANCELED);
 
-        tEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " RESUME");
+        tEnv.fromMaterializedTable(MT_NAME).resume();
 
         assertThat(getMaterializedTable().getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
         JobID resumedJobId = getRefreshJobId();
@@ -572,20 +589,6 @@ class MaterializedTableTableApiITCase {
                                 assertThat(message)
                                         .contains("without restoring state")
                                         .contains("and unset it afterwards (RESET in SQL)"));
-    }
-
-    @Test
-    void dropMissingWithIfExistsSucceeds() {
-        tEnv.executeSql("DROP MATERIALIZED TABLE IF EXISTS " + MT_NAME);
-
-        assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isFalse();
-    }
-
-    @Test
-    void dropMissingWithoutIfExistsThrows() {
-        assertThatThrownBy(() -> tEnv.executeSql("DROP MATERIALIZED TABLE " + MT_NAME))
-                .isInstanceOf(ValidationException.class)
-                .hasMessageContaining("does not exist");
     }
 
     @Test
@@ -695,7 +698,7 @@ class MaterializedTableTableApiITCase {
 
         JobID restoredJobId = getRefreshJobId();
         awaitAllVerticesRunning(restoredJobId);
-        tEnv.executeSql("DROP MATERIALIZED TABLE " + MT_NAME);
+        assertThat(tEnv.dropMaterializedTable(MT_NAME, false)).isTrue();
         awaitJobStatus(restoredJobId, JobStatus.CANCELED);
     }
 
@@ -798,12 +801,13 @@ class MaterializedTableTableApiITCase {
         tEnv.executeSql(continuousMaterializedTableDdl());
         JobID refreshJobId = getRefreshJobId();
         awaitAllVerticesRunning(refreshJobId);
+        final MaterializedTable handle = tEnv.fromMaterializedTable(MT_NAME);
 
         try (NetUtils.Port unusedPort = NetUtils.getAvailablePort()) {
             tEnv.getConfig().set(RestOptions.PORT, unusedPort.getPort());
             tEnv.getConfig().set(RestOptions.RETRY_MAX_ATTEMPTS, 0);
 
-            tEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " SUSPEND");
+            handle.suspend();
         }
 
         assertThat(getMaterializedTable().getRefreshStatus()).isEqualTo(RefreshStatus.SUSPENDED);
@@ -867,10 +871,9 @@ class MaterializedTableTableApiITCase {
         final JobID refreshJobId = getRefreshJobId();
         awaitAllVerticesRunning(refreshJobId);
         catalog.failNextAlterTable(hasRefreshStatus(RefreshStatus.SUSPENDED));
+        final MaterializedTable handle = tEnv.fromMaterializedTable(MT_NAME);
 
-        final Throwable suspendFailure =
-                catchThrowable(
-                        () -> tEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " SUSPEND"));
+        final Throwable suspendFailure = catchThrowable(handle::suspend);
 
         final List<Path> savepoints;
         try (Stream<Path> savepointDirEntries = Files.list(savepointDir)) {
@@ -895,19 +898,23 @@ class MaterializedTableTableApiITCase {
         JobID originalJobId = getRefreshJobId();
         awaitAllVerticesRunning(originalJobId);
 
-        StreamTableEnvironment otherEnv = createTableEnvOnSharedCatalogWithSavepointDirectory();
+        final MaterializedTable otherSessionHandle =
+                createTableEnvOnSharedCatalogWithSavepointDirectory()
+                        .fromMaterializedTable(MT_NAME);
 
-        otherEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " SUSPEND");
+        otherSessionHandle.suspend();
         assertThat(getMaterializedTable().getRefreshStatus()).isEqualTo(RefreshStatus.SUSPENDED);
         awaitJobStatus(originalJobId, JobStatus.FINISHED);
 
-        otherEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " RESUME");
+        otherSessionHandle.resume();
         assertThat(getMaterializedTable().getRefreshStatus()).isEqualTo(RefreshStatus.ACTIVATED);
         JobID resumedJobId = getRefreshJobId();
         awaitAllVerticesRunning(resumedJobId);
 
-        createTableEnvOnSharedCatalogWithSavepointDirectory()
-                .executeSql("DROP MATERIALIZED TABLE " + MT_NAME);
+        assertThat(
+                        createTableEnvOnSharedCatalogWithSavepointDirectory()
+                                .dropMaterializedTable(MT_NAME))
+                .isTrue();
         assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isFalse();
         awaitJobStatus(resumedJobId, JobStatus.CANCELED);
     }
@@ -917,16 +924,13 @@ class MaterializedTableTableApiITCase {
             throws Exception {
         tEnv.executeSql(continuousMaterializedTableDdl());
         awaitAllVerticesRunning(getRefreshJobId());
-        tEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " SUSPEND");
+        tEnv.fromMaterializedTable(MT_NAME).suspend();
         final ContinuousRefreshHandler suspendedHandler = getRefreshHandler();
 
-        final StreamTableEnvironment renamingEnv =
-                createTableEnvRegisteringTheCatalogAs("renamed_cat");
+        final MaterializedTable renamingHandle =
+                createTableEnvRegisteringTheCatalogAs("renamed_cat").fromMaterializedTable(MT_NAME);
 
-        assertThatThrownBy(
-                        () ->
-                                renamingEnv.executeSql(
-                                        "ALTER MATERIALIZED TABLE " + MT_NAME + " RESUME"))
+        assertThatThrownBy(() -> renamingHandle.resume())
                 .isInstanceOf(TableException.class)
                 .hasMessageContaining("Failed to resume the continuous refresh job")
                 .hasStackTraceContaining("Object 'mt_cat' not found");
@@ -1012,7 +1016,7 @@ class MaterializedTableTableApiITCase {
         assertThatThrownBy(
                         () ->
                                 createTableEnvOnSharedCatalog(EnvironmentSettings.inStreamingMode())
-                                        .executeSql("DROP MATERIALIZED TABLE " + MT_NAME))
+                                        .dropMaterializedTable(MT_NAME))
                 .isInstanceOf(TableException.class)
                 .hasStackTraceContaining(unknownJobId)
                 .hasStackTraceContaining("'rest.address'");
@@ -1073,13 +1077,14 @@ class MaterializedTableTableApiITCase {
                         + "  'fields.k.max' = '3'\n"
                         + ")");
 
-        aggregate(rootTargetEnv, "slow_bounded_source")
-                .materializeInto(MT_NAME, continuousDescriptor())
-                .execute();
+        final MaterializedTable materializedTable =
+                aggregate(rootTargetEnv, "slow_bounded_source")
+                        .materializeInto(MT_NAME, continuousDescriptor())
+                        .execute();
         final JobID refreshJobId = getRefreshJobId();
         awaitAllVerticesRunning(refreshJobId);
 
-        rootTargetEnv.executeSql("DROP MATERIALIZED TABLE " + MT_NAME);
+        assertThat(materializedTable.drop()).isTrue();
 
         assertThat(catalog.tableExists(new ObjectPath(DATABASE, MT_NAME))).isFalse();
         awaitJobStatus(refreshJobId, JobStatus.CANCELED);
@@ -1090,8 +1095,9 @@ class MaterializedTableTableApiITCase {
         tEnv.executeSql(continuousMaterializedTableDdl());
         awaitAllVerticesRunning(getRefreshJobId());
 
-        tEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " SUSPEND");
-        tEnv.executeSql("ALTER MATERIALIZED TABLE " + MT_NAME + " RESUME");
+        final MaterializedTable materializedTable = tEnv.fromMaterializedTable(MT_NAME);
+        materializedTable.suspend();
+        materializedTable.resume();
 
         tEnv.executeSql(
                 "CREATE TABLE blackhole_sink (k INT, v BIGINT) WITH ('connector' = 'blackhole')");
@@ -1196,11 +1202,9 @@ class MaterializedTableTableApiITCase {
                         + ")");
 
         noSavepointEnv.executeSql(continuousMaterializedTableDdl());
+        final MaterializedTable materializedTable = noSavepointEnv.fromMaterializedTable(MT_NAME);
 
-        assertThatThrownBy(
-                        () ->
-                                noSavepointEnv.executeSql(
-                                        "ALTER MATERIALIZED TABLE " + MT_NAME + " SUSPEND"))
+        assertThatThrownBy(materializedTable::suspend)
                 .isInstanceOf(TableException.class)
                 .rootCause()
                 .isInstanceOf(ValidationException.class)
@@ -1534,7 +1538,7 @@ class MaterializedTableTableApiITCase {
                     .isEqualTo(RefreshStatus.ACTIVATED);
         }
         for (String tableName : tableNames) {
-            tEnv.executeSql("DROP MATERIALIZED TABLE " + tableName);
+            assertThat(tEnv.dropMaterializedTable(tableName)).isTrue();
         }
     }
 

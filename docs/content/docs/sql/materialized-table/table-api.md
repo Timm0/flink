@@ -332,6 +332,45 @@ the name of its catalog. Otherwise `toQuery()` fails with a `ValidationException
 `toDescriptor()` returns values as stored in the catalog, for example options, normalized refresh
 strategy.
 
+## Managing a materialized table's lifecycle
+
+```java
+MaterializedTable silver = tEnv.fromMaterializedTable("silver");
+
+silver.suspend();
+silver.resume(Map.of("sink.parallelism", "2"));
+```
+
+`suspend()` mirrors
+[`ALTER MATERIALIZED TABLE ... SUSPEND`]({{< ref "docs/sql/materialized-table/statements" >}}#suspend).
+It stops the continuous refresh job with a savepoint, which needs
+`execution.checkpointing.savepoint-dir`, and records the materialized table as `SUSPENDED`.
+
+`resume()` and `resume(options)` mirror
+[`ALTER MATERIALIZED TABLE ... RESUME`]({{< ref "docs/sql/materialized-table/statements" >}}#resume).
+They start a refresh job that restores the savepoint taken by `suspend()`. Redeploying or altering
+the materialized table while it is suspended clears that savepoint (see [Redeploying](#redeploying)),
+and the refresh job then starts without state. The options of `resume(options)` apply to that
+refresh job only and are not stored. `resume()` returns once the refresh job is submitted and the
+materialized table is recorded as `ACTIVATED`, not when the job is running. If the refresh job
+cannot be started, the materialized table keeps its refresh status. On an `ACTIVATED` materialized
+table whose refresh job has already ended, for example because it was cancelled outside the
+materialized table, `resume()` starts a new refresh job without state. This works only while the
+cluster still knows the ended job, otherwise `resume()` fails with a `TableException`. If
+`execution.state-recovery.path` is set on the `TableConfig`, a refresh job that would start without
+state restores that savepoint instead.
+
+Like a redeploy, `resume()` starts the refresh job only with the target and cluster id recorded in
+the catalog (see [Requirements](#requirements)). A different target or cluster id fails with a
+`ValidationException` before anything is started, and the materialized table stays as it is.
+
+The following operations need the SQL Gateway and fail in a `TableEnvironment`
+- suspending, resuming or dropping a materialized table in full refresh mode,
+- resuming a materialized table whose refresh job runs in its own application cluster.
+
+Suspending a materialized table whose refresh job runs in its own application cluster works, and
+ends that application cluster.
+
 ## Dropping a materialized table
 
 ```java
@@ -354,3 +393,15 @@ view at its path, fails with a `ValidationException`.
 The method only drops permanent objects. If a temporary table or view shadows the materialized
 table, the call fails with a `ValidationException`, also with `ignoreIfNotExists = true`. Drop the
 temporary object first with `dropTemporaryTable` or `dropTemporaryView`.
+
+A handle drops its materialized table with `drop()` or `drop(ignoreIfNotExists)`:
+
+```java
+MaterializedTable revenue = tEnv.fromMaterializedTable("revenue");
+boolean dropped = revenue.drop();
+```
+
+`drop()` and `drop(ignoreIfNotExists)` behave like `dropMaterializedTable(path)` and
+`dropMaterializedTable(path, ignoreIfNotExists)` for the handle's identifier. So `drop()` is
+`drop(true)`. It returns `false` if the materialized table no longer exists, and `drop(false)`
+fails with a `ValidationException` instead.
